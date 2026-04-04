@@ -6,10 +6,11 @@ from scipy.optimize import curve_fit
 from scipy.special import factorial, hermite
 
 SIGMA_TO_FWHM = 2.0 * np.sqrt(2.0 * np.log(2.0))
-MODEL_ORDER = ["double_gaussian", "gauss_hermite", "shapelet"]
+MODEL_ORDER = ["double_gaussian", "gauss_hermite", "moffat", "shapelet"]
 MODEL_LABELS = {
     "double_gaussian": "Double Gaussian",
     "gauss_hermite": "Gauss-Hermite",
+    "moffat": "Moffat",
     "shapelet": "Shapelet",
 }
 
@@ -244,7 +245,66 @@ def fit_gauss_hermite_image(image, center=None):
 
 
 ############################################
-# 4. Shapelets
+# 4. Moffat
+############################################
+
+
+def moffat_2d(coords, A, x0, y0, alpha, beta, B):
+    x, y = coords
+    r2 = (x - x0) ** 2 + (y - y0) ** 2
+    return A * (1 + r2 / alpha**2) ** (-beta) + B
+
+
+def fit_moffat_image(image, center=None, fwhm=None):
+    """Fit a Moffat profile using the shared evaluation center."""
+    image = np.asarray(image, dtype=float)
+    ny, nx = image.shape
+
+    if center is None:
+        center = image_center(image)
+
+    x0, y0 = center
+    yy, xx = np.indices(image.shape)
+    coords = (xx.ravel(), yy.ravel())
+    data = image.ravel()
+
+    alpha_guess = (fwhm / SIGMA_TO_FWHM) if fwhm is not None else min(nx, ny) / 4.0
+    p0 = [np.max(data), x0, y0, alpha_guess, 3.0, np.median(data)]
+
+    try:
+        params, cov = curve_fit(
+            moffat_2d,
+            coords,
+            data,
+            p0=p0,
+            maxfev=10000,
+        )
+    except RuntimeError:
+        params = np.asarray(p0, dtype=float)
+        cov = None
+
+    model = moffat_2d(coords, *params).reshape(image.shape)
+    residual = image - model
+
+    radius, image_profile = radial_profile(image, center=center)
+    _, model_profile = radial_profile(model, center=center)
+
+    return {
+        "params": params,
+        "cov": cov,
+        "model": model,
+        "residual": residual,
+        "chi2": np.mean(residual**2),
+        "center": center,
+        "rp_radius": radius,
+        "rp_image": image_profile,
+        "rp_model": model_profile,
+        "rp_residual": image_profile - model_profile,
+    }
+
+
+############################################
+# 5. Shapelets
 ############################################
 
 
@@ -345,7 +405,7 @@ def summarize_coefficients(coeffs, modes):
 
 
 ############################################
-# 5. Model comparison helpers
+# 6. Model comparison helpers
 ############################################
 
 
@@ -353,6 +413,7 @@ def pick_best_model(result):
     chi2_map = {
         "double_gaussian": result["dg_chi2"],
         "gauss_hermite": result["gh_chi2"],
+        "moffat": result["moffat_chi2"],
         "shapelet": result["shapelet_chi2"],
     }
     best_key = min(chi2_map, key=chi2_map.get)
@@ -371,6 +432,7 @@ def analyze_psf_models(image, x=None, y=None, fwhm=None, shapelet_beta=2.0, shap
 
     dg = fit_double_gaussian_image(image, sigma_guess=sigma_guess, center=center)
     gh = fit_gauss_hermite_image(image, center=center)
+    moffat = fit_moffat_image(image, center=center, fwhm=fwhm)
     shapelet = fit_shapelet_image(
         image,
         center=center,
@@ -400,6 +462,13 @@ def analyze_psf_models(image, x=None, y=None, fwhm=None, shapelet_beta=2.0, shap
         "gh_chi2": gh["chi2"],
         "rp_gh": gh["rp_model"],
         "rp_gh_residual": gh["rp_residual"],
+        "moffat_params": moffat["params"],
+        "moffat_cov": moffat["cov"],
+        "moffat_array": moffat["model"],
+        "moffat_residual": moffat["residual"],
+        "moffat_chi2": moffat["chi2"],
+        "rp_moffat": moffat["rp_model"],
+        "rp_moffat_residual": moffat["rp_residual"],
         "shapelet_result": shapelet["result"],
         "shapelet_array": shapelet["model"],
         "shapelet_residual": shapelet["residual"],
@@ -421,7 +490,7 @@ def count_best_models(results):
 
 
 ############################################
-# 6. Plotting
+# 7. Plotting
 ############################################
 
 
@@ -431,12 +500,12 @@ def plot_model_comparison_page(results, start, page_size, visit_id, detector_id,
     if n <= 0:
         return
 
-    fig, axes = plt.subplots(n, 9, figsize=(34, 4.5 * n))
+    fig, axes = plt.subplots(n, 11, figsize=(42, 4.5 * n))
     if n == 1:
         axes = axes[np.newaxis, :]
 
     fig.suptitle(
-        "Observed star vs Double Gaussian / Gauss-Hermite / Shapelet - Visit %s, Detector %s, Band %s (stars %d-%d of %d)"
+        "Observed star vs Double Gaussian / Gauss-Hermite / Moffat / Shapelet - Visit %s, Detector %s, Band %s (stars %d-%d of %d)"
         % (visit_id, detector_id, band, start + 1, end, len(results)),
         fontsize=14,
         y=1.01,
@@ -518,34 +587,56 @@ def plot_model_comparison_page(results, start, page_size, visit_id, detector_id,
         axes[idx, 4].set_title("GH Residual\nchi^2=%.4e" % r["gh_chi2"], fontsize=9)
         fig.colorbar(im4, ax=axes[idx, 4], shrink=0.75)
 
+        moffat_p = r["moffat_params"]
+        title_moffat = "Moffat\nalpha=%.4f, beta=%.4f" % (moffat_p[3], moffat_p[4])
+        im5 = axes[idx, 5].imshow(
+            r["moffat_array"],
+            vmin=-max_val,
+            vmax=max_val,
+            cmap="viridis",
+            origin="lower",
+        )
+        axes[idx, 5].set_title(title_moffat, fontsize=9)
+        fig.colorbar(im5, ax=axes[idx, 5], shrink=0.75)
+
+        im6 = axes[idx, 6].imshow(
+            r["moffat_residual"],
+            vmin=-res_scale,
+            vmax=res_scale,
+            cmap="RdBu_r",
+            origin="lower",
+        )
+        axes[idx, 6].set_title("Moffat Residual\nchi^2=%.4e" % r["moffat_chi2"], fontsize=9)
+        fig.colorbar(im6, ax=axes[idx, 6], shrink=0.75)
+
         title_shapelet = "Shapelet\nbeta=%.2f, nmax=%d" % (
             shapelet_meta["beta"],
             shapelet_meta["nmax"],
         )
-        im5 = axes[idx, 5].imshow(
+        im7 = axes[idx, 7].imshow(
             r["shapelet_array"],
             vmin=-max_val,
             vmax=max_val,
             cmap="viridis",
             origin="lower",
         )
-        axes[idx, 5].set_title(title_shapelet, fontsize=9)
-        fig.colorbar(im5, ax=axes[idx, 5], shrink=0.75)
+        axes[idx, 7].set_title(title_shapelet, fontsize=9)
+        fig.colorbar(im7, ax=axes[idx, 7], shrink=0.75)
 
-        im6 = axes[idx, 6].imshow(
+        im8 = axes[idx, 8].imshow(
             r["shapelet_residual"],
             vmin=-res_scale,
             vmax=res_scale,
             cmap="RdBu_r",
             origin="lower",
         )
-        axes[idx, 6].set_title(
+        axes[idx, 8].set_title(
             "Shapelet Residual\nchi^2=%.4e" % r["shapelet_chi2"],
             fontsize=9,
         )
-        fig.colorbar(im6, ax=axes[idx, 6], shrink=0.75)
+        fig.colorbar(im8, ax=axes[idx, 8], shrink=0.75)
 
-        axes[idx, 7].plot(
+        axes[idx, 9].plot(
             r["rp_radius"],
             r["rp_psf"],
             "o-",
@@ -553,7 +644,7 @@ def plot_model_comparison_page(results, start, page_size, visit_id, detector_id,
             lw=1.0,
             label="Observed star",
         )
-        axes[idx, 7].plot(
+        axes[idx, 9].plot(
             r["rp_radius"],
             r["rp_dg"],
             "s--",
@@ -561,7 +652,7 @@ def plot_model_comparison_page(results, start, page_size, visit_id, detector_id,
             lw=1.0,
             label="Double Gaussian",
         )
-        axes[idx, 7].plot(
+        axes[idx, 9].plot(
             r["rp_radius"],
             r["rp_gh"],
             "^--",
@@ -569,7 +660,15 @@ def plot_model_comparison_page(results, start, page_size, visit_id, detector_id,
             lw=1.0,
             label="Gauss-Hermite",
         )
-        axes[idx, 7].plot(
+        axes[idx, 9].plot(
+            r["rp_radius"],
+            r["rp_moffat"],
+            "v--",
+            ms=2.5,
+            lw=1.0,
+            label="Moffat",
+        )
+        axes[idx, 9].plot(
             r["rp_radius"],
             r["rp_shapelet"],
             "d--",
@@ -577,14 +676,14 @@ def plot_model_comparison_page(results, start, page_size, visit_id, detector_id,
             lw=1.0,
             label="Shapelet",
         )
-        axes[idx, 7].set_title("Radial profile", fontsize=9)
-        axes[idx, 7].set_xlabel("Radius [pixel]")
-        axes[idx, 7].set_ylabel("Mean intensity")
-        axes[idx, 7].grid(alpha=0.3)
-        axes[idx, 7].legend(fontsize=7)
+        axes[idx, 9].set_title("Radial profile", fontsize=9)
+        axes[idx, 9].set_xlabel("Radius [pixel]")
+        axes[idx, 9].set_ylabel("Mean intensity")
+        axes[idx, 9].grid(alpha=0.3)
+        axes[idx, 9].legend(fontsize=7)
 
-        axes[idx, 8].axhline(0.0, color="k", lw=1)
-        axes[idx, 8].plot(
+        axes[idx, 10].axhline(0.0, color="k", lw=1)
+        axes[idx, 10].plot(
             r["rp_radius"],
             r["rp_dg_residual"],
             "s-",
@@ -592,7 +691,7 @@ def plot_model_comparison_page(results, start, page_size, visit_id, detector_id,
             lw=1.0,
             label="Data - DG",
         )
-        axes[idx, 8].plot(
+        axes[idx, 10].plot(
             r["rp_radius"],
             r["rp_gh_residual"],
             "^-",
@@ -600,7 +699,15 @@ def plot_model_comparison_page(results, start, page_size, visit_id, detector_id,
             lw=1.0,
             label="Data - GH",
         )
-        axes[idx, 8].plot(
+        axes[idx, 10].plot(
+            r["rp_radius"],
+            r["rp_moffat_residual"],
+            "v-",
+            ms=2.5,
+            lw=1.0,
+            label="Data - Moffat",
+        )
+        axes[idx, 10].plot(
             r["rp_radius"],
             r["rp_shapelet_residual"],
             "d-",
@@ -608,23 +715,18 @@ def plot_model_comparison_page(results, start, page_size, visit_id, detector_id,
             lw=1.0,
             label="Data - Shapelet",
         )
-        axes[idx, 8].set_title("Profile residuals", fontsize=9)
-        axes[idx, 8].set_xlabel("Radius [pixel]")
-        axes[idx, 8].set_ylabel("Profile residual")
-        axes[idx, 8].grid(alpha=0.3)
-        axes[idx, 8].legend(fontsize=7)
+        axes[idx, 10].set_title("Profile residuals", fontsize=9)
+        axes[idx, 10].set_xlabel("Radius [pixel]")
+        axes[idx, 10].set_ylabel("Profile residual")
+        axes[idx, 10].grid(alpha=0.3)
+        axes[idx, 10].legend(fontsize=7)
 
         for ax in axes[idx, :3]:
             ax.set_xlabel("x (pixel)")
             ax.set_ylabel("y (pixel)")
-        axes[idx, 3].set_xlabel("x (pixel)")
-        axes[idx, 3].set_ylabel("y (pixel)")
-        axes[idx, 4].set_xlabel("x (pixel)")
-        axes[idx, 4].set_ylabel("y (pixel)")
-        axes[idx, 5].set_xlabel("x (pixel)")
-        axes[idx, 5].set_ylabel("y (pixel)")
-        axes[idx, 6].set_xlabel("x (pixel)")
-        axes[idx, 6].set_ylabel("y (pixel)")
+        for col in [3, 4, 5, 6, 7, 8]:
+            axes[idx, col].set_xlabel("x (pixel)")
+            axes[idx, col].set_ylabel("y (pixel)")
 
     plt.tight_layout()
     plt.show()
@@ -639,7 +741,7 @@ def plot_best_model_counts(results):
     counts = count_best_models(results)
     labels = [MODEL_LABELS[name] for name in MODEL_ORDER]
     values = [counts[name] for name in MODEL_ORDER]
-    colors = ["tab:blue", "tab:orange", "tab:green"]
+    colors = ["tab:blue", "tab:orange", "tab:red", "tab:green"]
 
     fig, ax = plt.subplots(figsize=(7, 4))
     bars = ax.bar(labels, values, color=colors)
