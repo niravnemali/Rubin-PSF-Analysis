@@ -20,11 +20,13 @@ MODEL_LABELS = {
 
 
 def image_center(image):
+    """Return the shared geometric center used for fair model comparison."""
     ny, nx = image.shape
     return ((nx - 1) / 2.0, (ny - 1) / 2.0)
 
 
 def radial_profile(image, center=None):
+    """Compute a radial profile using the shared center convention by default."""
     image = np.asarray(image, dtype=float)
 
     if center is None:
@@ -73,16 +75,16 @@ def double_gaussian(r, a1, sigma1, a2, sigma2):
 
 
 def fit_double_gaussian_image(image, sigma_guess=None, center=None):
+    """Fit the radial double-Gaussian model using the shared evaluation center."""
     image = np.asarray(image, dtype=float)
     ny, nx = image.shape
 
     if center is None:
         center = image_center(image)
 
+    x0, y0 = center
     yy, xx = np.indices(image.shape)
-
-    # Preserve the notebook's original fitting convention.
-    distances = np.sqrt((xx - nx / 2.0) ** 2 + (yy - ny / 2.0) ** 2)
+    distances = np.sqrt((xx - x0) ** 2 + (yy - y0) ** 2)
     data = image.ravel()
 
     if sigma_guess is None:
@@ -122,6 +124,7 @@ def fit_double_gaussian_image(image, sigma_guess=None, center=None):
         "model": model,
         "residual": residual,
         "chi2": np.mean(residual**2),
+        "center": center,
         "rp_radius": radius,
         "rp_image": image_profile,
         "rp_model": model_profile,
@@ -175,7 +178,8 @@ def gauss_hermite_2d(
     return A * G * modifier + B
 
 
-def fit_gauss_hermite(image):
+def fit_gauss_hermite(image, center=None):
+    """Fit Gauss-Hermite terms with a shared center initial guess for fairness."""
     ny, nx = image.shape
 
     y, x = np.mgrid[:ny, :nx]
@@ -183,8 +187,9 @@ def fit_gauss_hermite(image):
     data = image.ravel()
 
     A0 = image.max()
-    x0 = nx / 2
-    y0 = ny / 2
+    if center is None:
+        center = image_center(image)
+    x0, y0 = center
 
     p0 = [
         A0,
@@ -210,13 +215,14 @@ def fit_gauss_hermite(image):
 
 
 def fit_gauss_hermite_image(image, center=None):
+    """Fit and evaluate Gauss-Hermite with the shared analysis center."""
     image = np.asarray(image, dtype=float)
 
     if center is None:
         center = image_center(image)
 
     yy, xx = np.indices(image.shape)
-    params, cov = fit_gauss_hermite(image)
+    params, cov = fit_gauss_hermite(image, center=center)
     model = gauss_hermite_2d((xx.ravel(), yy.ravel()), *params).reshape(image.shape)
     residual = image - model
 
@@ -229,6 +235,7 @@ def fit_gauss_hermite_image(image, center=None):
         "model": model,
         "residual": residual,
         "chi2": np.mean(residual**2),
+        "center": center,
         "rp_radius": radius,
         "rp_image": image_profile,
         "rp_model": model_profile,
@@ -268,12 +275,16 @@ def build_design_matrix(x, y, beta, nmax):
     return phi, modes
 
 
-def fit_shapelets(image, beta=2.0, nmax=6):
+def fit_shapelets(image, beta=2.0, nmax=6, center=None):
+    """Fit shapelets, optionally forcing the shared center for fair comparison."""
     ny, nx = image.shape
     y, x = np.mgrid[:ny, :nx]
 
-    x0 = np.sum(x * image) / np.sum(image)
-    y0 = np.sum(y * image) / np.sum(image)
+    if center is None:
+        x0 = np.sum(x * image) / np.sum(image)
+        y0 = np.sum(y * image) / np.sum(image)
+    else:
+        x0, y0 = center
 
     x = x - x0
     y = y - y0
@@ -294,12 +305,13 @@ def fit_shapelets(image, beta=2.0, nmax=6):
 
 
 def fit_shapelet_image(image, center=None, beta=2.0, nmax=6):
+    """Fit and evaluate shapelets with the shared analysis center."""
     image = np.asarray(image, dtype=float)
 
     if center is None:
         center = image_center(image)
 
-    shapelet_result = fit_shapelets(image, beta=beta, nmax=nmax)
+    shapelet_result = fit_shapelets(image, beta=beta, nmax=nmax, center=center)
     model = shapelet_result["model"]
     residual = image - model
 
@@ -311,6 +323,7 @@ def fit_shapelet_image(image, center=None, beta=2.0, nmax=6):
         "model": model,
         "residual": residual,
         "chi2": np.mean(residual**2),
+        "center": center,
         "rp_radius": radius,
         "rp_image": image_profile,
         "rp_model": model_profile,
@@ -347,6 +360,7 @@ def pick_best_model(result):
 
 
 def analyze_psf_models(image, x=None, y=None, fwhm=None, shapelet_beta=2.0, shapelet_nmax=6):
+    """Run all model fits with one shared geometric center for a fair comparison."""
     image = np.asarray(image, dtype=float)
     center = image_center(image)
     radius, psf_profile = radial_profile(image, center=center)
@@ -367,6 +381,7 @@ def analyze_psf_models(image, x=None, y=None, fwhm=None, shapelet_beta=2.0, shap
     result = {
         "x": x,
         "y": y,
+        "center": center,
         "psf_array": image,
         "fwhm": fwhm,
         "max_val": np.max(np.abs(image)),
@@ -421,7 +436,7 @@ def plot_model_comparison_page(results, start, page_size, visit_id, detector_id,
         axes = axes[np.newaxis, :]
 
     fig.suptitle(
-        "PSF vs Double Gaussian / Gauss-Hermite / Shapelet - Visit %s, Detector %s, Band %s (stars %d-%d of %d)"
+        "Observed star vs Double Gaussian / Gauss-Hermite / Shapelet - Visit %s, Detector %s, Band %s (stars %d-%d of %d)"
         % (visit_id, detector_id, band, start + 1, end, len(results)),
         fontsize=14,
         y=1.01,
@@ -434,7 +449,7 @@ def plot_model_comparison_page(results, start, page_size, visit_id, detector_id,
         gh = r["gh_params"]
         shapelet_meta = r["shapelet_result"]
 
-        title_psf = "Star %d: PSF\n(x=%.0f, y=%.0f)\nFWHM=%.2f pix\nBest=%s" % (
+        title_psf = "Star %d: Observed star\n(x=%.0f, y=%.0f)\nFWHM=%.2f pix\nBest=%s" % (
             i + 1,
             r["x"],
             r["y"],
@@ -477,8 +492,6 @@ def plot_model_comparison_page(results, start, page_size, visit_id, detector_id,
         axes[idx, 2].set_title("DG Residual\nchi^2=%.4e" % r["dg_chi2"], fontsize=9)
         fig.colorbar(im2, ax=axes[idx, 2], shrink=0.75)
 
-        axes[idx, 3].plot(r["rp_radius"], r["rp_psf"], "o-", ms=2.5, lw=1.0, label="PSF")
-        axes[idx, 3].plot(r["rp_radius"], r["rp_dg"], "s--", ms=2.5, lw=1.0, label="DG")
         title_gh = "Gauss-Hermite\nh3x=%.4f, h4x=%.4f\nh3y=%.4f, h4y=%.4f" % (
             gh[5],
             gh[6],
@@ -538,7 +551,7 @@ def plot_model_comparison_page(results, start, page_size, visit_id, detector_id,
             "o-",
             ms=2.5,
             lw=1.0,
-            label="PSF",
+            label="Observed star",
         )
         axes[idx, 7].plot(
             r["rp_radius"],
@@ -577,7 +590,7 @@ def plot_model_comparison_page(results, start, page_size, visit_id, detector_id,
             "s-",
             ms=2.5,
             lw=1.0,
-            label="PSF - DG",
+            label="Data - DG",
         )
         axes[idx, 8].plot(
             r["rp_radius"],
@@ -585,7 +598,7 @@ def plot_model_comparison_page(results, start, page_size, visit_id, detector_id,
             "^-",
             ms=2.5,
             lw=1.0,
-            label="PSF - GH",
+            label="Data - GH",
         )
         axes[idx, 8].plot(
             r["rp_radius"],
@@ -593,7 +606,7 @@ def plot_model_comparison_page(results, start, page_size, visit_id, detector_id,
             "d-",
             ms=2.5,
             lw=1.0,
-            label="PSF - Shapelet",
+            label="Data - Shapelet",
         )
         axes[idx, 8].set_title("Profile residuals", fontsize=9)
         axes[idx, 8].set_xlabel("Radius [pixel]")
@@ -632,7 +645,7 @@ def plot_best_model_counts(results):
     bars = ax.bar(labels, values, color=colors)
     ax.set_title("Best-Fit Model Counts")
     ax.set_xlabel("Model")
-    ax.set_ylabel("Number of PSF stamps")
+    ax.set_ylabel("Number of observed star stamps")
     ax.grid(axis="y", alpha=0.3)
 
     for bar, value in zip(bars, values):
