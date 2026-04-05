@@ -1,9 +1,18 @@
+import io
 from collections import Counter
 
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy.optimize import curve_fit
 from scipy.special import factorial, hermite
+
+try:
+    from IPython.display import Image as _IPyImage, display as _ipython_display
+    _IPYTHON_AVAILABLE = True
+except ImportError:
+    _IPYTHON_AVAILABLE = False
+
+_PLOT_DPI = 72  # lower DPI reduces pixel count and speeds up rendering
 
 SIGMA_TO_FWHM = 2.0 * np.sqrt(2.0 * np.log(2.0))
 MODEL_ORDER = ["double_gaussian", "gauss_hermite", "moffat", "shapelet"]
@@ -494,6 +503,23 @@ def count_best_models(results):
 ############################################
 
 
+def _render_and_display(fig):
+    """Render a figure to a PNG buffer and display it, then close it.
+
+    Using fig.savefig() directly to a BytesIO at a reduced DPI is significantly
+    faster than plt.show() in Jupyter, which re-renders through the inline backend.
+    """
+    if _IPYTHON_AVAILABLE:
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', dpi=_PLOT_DPI, bbox_inches='tight')
+        plt.close(fig)
+        buf.seek(0)
+        _ipython_display(_IPyImage(buf.getvalue()))
+    else:
+        plt.show()
+        plt.close(fig)
+
+
 def plot_model_comparison_page(results, start, page_size, visit_id, detector_id, band):
     end = min(start + page_size, len(results))
     n = end - start
@@ -729,7 +755,7 @@ def plot_model_comparison_page(results, start, page_size, visit_id, detector_id,
             axes[idx, col].set_ylabel("y (pixel)")
 
     plt.tight_layout()
-    plt.show()
+    _render_and_display(fig)
 
 
 def plot_model_comparison_pages(results, page_size, visit_id, detector_id, band):
@@ -760,7 +786,7 @@ def plot_best_model_counts(results):
         )
 
     plt.tight_layout()
-    plt.show()
+    _render_and_display(fig)
 
     return counts
 
