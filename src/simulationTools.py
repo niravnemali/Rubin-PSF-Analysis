@@ -7,10 +7,18 @@ from scipy.optimize import curve_fit
 from scipy.special import factorial, hermite
 
 SIGMA_TO_FWHM = 2.0 * np.sqrt(2.0 * np.log(2.0))
-MODEL_ORDER = ["gaussian", "double_gaussian", "gauss_hermite", "moffat", "shapelet"]
+MODEL_ORDER = [
+    "gaussian",
+    "double_gaussian",
+    "elliptical_double_gaussian",
+    "gauss_hermite",
+    "moffat",
+    "shapelet",
+]
 MODEL_LABELS = {
     "gaussian": "Gaussian",
     "double_gaussian": "Double Gaussian",
+    "elliptical_double_gaussian": "Elliptical Double Gaussian",
     "gauss_hermite": "Gauss-Hermite",
     "moffat": "Moffat",
     "shapelet": "Shapelet",
@@ -18,6 +26,7 @@ MODEL_LABELS = {
 MODEL_COLORS = {
     "gaussian": "tab:purple",
     "double_gaussian": "tab:blue",
+    "elliptical_double_gaussian": "tab:brown",
     "gauss_hermite": "tab:orange",
     "moffat": "tab:red",
     "shapelet": "tab:green",
@@ -25,6 +34,7 @@ MODEL_COLORS = {
 MODEL_MARKERS = {
     "gaussian": "o",
     "double_gaussian": "s",
+    "elliptical_double_gaussian": "P",
     "gauss_hermite": "^",
     "moffat": "v",
     "shapelet": "d",
@@ -435,6 +445,41 @@ def make_heavy_wing_psf(size, sigma_core, wing_strength, wing_scale, center=None
     return normalize_flux(image)
 
 
+def add_poisson_like_gaussian_noise(
+    image,
+    total_counts,
+    rng=None,
+    clip_negative=True,
+    renormalize=True,
+):
+    """
+    Add a simple Poisson-like Gaussian noise realization to a unit-flux PSF image.
+
+    The image is first interpreted as an expectation map with total counts
+    `total_counts`. Each pixel with expected count K receives Gaussian noise with
+    sigma sqrt(K). By default negative noisy counts are clipped to zero and the
+    output is renormalized back to unit total flux so it can be fed directly into
+    the single-stamp analysis pipeline.
+    """
+    image = normalize_flux(np.asarray(image, dtype=float))
+    rng = np.random.default_rng(rng)
+
+    expected_counts = np.clip(image, 0.0, None) * float(total_counts)
+    noisy_counts = expected_counts + rng.normal(
+        loc=0.0,
+        scale=np.sqrt(expected_counts),
+        size=expected_counts.shape,
+    )
+
+    if clip_negative:
+        noisy_counts = np.clip(noisy_counts, 0.0, None)
+
+    if renormalize:
+        return normalize_flux(noisy_counts)
+
+    return noisy_counts
+
+
 def _elliptical_coordinates(shape, center, theta=0.0):
     """Return rotated coordinates relative to a common image center."""
     y, x = np.indices(shape)
@@ -494,6 +539,37 @@ def make_elliptical_heavy_wing_psf(
     wings = np.exp(-elliptical_radius / wing_scale)
     image = core + wing_strength * wings
     return normalize_flux(image)
+
+
+def make_elliptical_double_gaussian_psf(
+    size,
+    sigma1_x,
+    sigma1_y,
+    sigma2_x,
+    sigma2_y,
+    amp1=1.0,
+    amp2=0.2,
+    theta=0.0,
+    center=None,
+):
+    """
+    Generate a centered, normalized elliptical double-Gaussian PSF.
+
+    This is a controlled truth model for later EDG-vs-deviant synthetic tests.
+    Both Gaussian components share the same center and rotation.
+    """
+    if isinstance(size, int):
+        ny = nx = size
+    else:
+        ny, nx = size
+
+    if center is None:
+        center = image_center_from_shape((ny, nx))
+
+    x_rot, y_rot = _elliptical_coordinates((ny, nx), center, theta=theta)
+    g1 = amp1 * np.exp(-0.5 * ((x_rot / sigma1_x) ** 2 + (y_rot / sigma1_y) ** 2))
+    g2 = amp2 * np.exp(-0.5 * ((x_rot / sigma2_x) ** 2 + (y_rot / sigma2_y) ** 2))
+    return normalize_flux(g1 + g2)
 
 
 def show_psf(image, title=None, ax=None, cmap="viridis"):
@@ -677,7 +753,217 @@ def fit_double_gaussian_image(
 
 
 ############################################
-# 5. Gauss-Hermite
+# 5. Elliptical Double Gaussian
+############################################
+
+
+def elliptical_double_gaussian_2d(coords, A1, x0, y0, sigma1_x, sigma1_y, A2, sigma2_x, sigma2_y, theta, B):
+    """Two co-centered elliptical Gaussians with a shared rotation angle."""
+    x, y = coords
+    dx = x - x0
+    dy = y - y0
+
+    cos_t = np.cos(theta)
+    sin_t = np.sin(theta)
+    x_rot = cos_t * dx + sin_t * dy
+    y_rot = -sin_t * dx + cos_t * dy
+
+    g1 = A1 * np.exp(-0.5 * ((x_rot / sigma1_x) ** 2 + (y_rot / sigma1_y) ** 2))
+    g2 = A2 * np.exp(-0.5 * ((x_rot / sigma2_x) ** 2 + (y_rot / sigma2_y) ** 2))
+    return g1 + g2 + B
+
+
+def _edg_initial_guess(image, sigma_hint=None, center=None):
+    """Build a stable first-pass parameter guess for the EDG fit."""
+    image = np.asarray(image, dtype=float)
+    ny, nx = image.shape
+
+    if center is None:
+        center = image_center(image)
+
+    x0, y0 = center
+    sigma0 = sigma_hint if sigma_hint is not None else min(nx, ny) / 4.0
+    sigma0 = float(max(sigma0, 0.5))
+
+    shape = compute_second_moment_shape(image, center=center)
+    Mxx = shape.get("Mxx", np.nan)
+    Myy = shape.get("Myy", np.nan)
+    Mxy = shape.get("Mxy", np.nan)
+
+    if np.all(np.isfinite([Mxx, Myy, Mxy])) and (Mxx + Myy) > 0:
+        moment_matrix = np.array([[Mxx, Mxy], [Mxy, Myy]], dtype=float)
+        eigvals, eigvecs = np.linalg.eigh(moment_matrix)
+        eigvals = np.clip(eigvals, 0.05**2, None)
+        sigma_minor = float(np.sqrt(eigvals[0]))
+        sigma_major = float(np.sqrt(eigvals[1]))
+        major_vec = eigvecs[:, 1]
+        theta0 = float(np.arctan2(major_vec[1], major_vec[0]))
+    else:
+        sigma_major = 1.1 * sigma0
+        sigma_minor = 0.9 * sigma0
+        theta0 = 0.0
+
+    theta0 = ((theta0 + 0.5 * np.pi) % np.pi) - 0.5 * np.pi
+    A0 = float(np.nanmax(image)) if np.any(np.isfinite(image)) else 1.0
+
+    return {
+        "A1": A0,
+        "x0": float(x0),
+        "y0": float(y0),
+        "sigma1_x": max(sigma_major, 0.05),
+        "sigma1_y": max(sigma_minor, 0.05),
+        "A2": 0.2 * A0,
+        "sigma2_x": max(2.0 * sigma_major, 0.05),
+        "sigma2_y": max(2.0 * sigma_minor, 0.05),
+        "theta": theta0,
+        "B": 0.0,
+    }
+
+
+def _canonicalize_edg_params(params_named):
+    """Sort EDG components from narrower to broader and wrap theta consistently."""
+    params_named = dict(params_named)
+    theta = params_named.get("theta", 0.0)
+    if np.isfinite(theta):
+        params_named["theta"] = float(((theta + 0.5 * np.pi) % np.pi) - 0.5 * np.pi)
+
+    sigma1_radius = np.sqrt(
+        max(params_named.get("sigma1_x", np.nan), 0.0) * max(params_named.get("sigma1_y", np.nan), 0.0)
+    )
+    sigma2_radius = np.sqrt(
+        max(params_named.get("sigma2_x", np.nan), 0.0) * max(params_named.get("sigma2_y", np.nan), 0.0)
+    )
+
+    if np.isfinite(sigma1_radius) and np.isfinite(sigma2_radius) and sigma2_radius < sigma1_radius:
+        params_named["A1"], params_named["A2"] = params_named.get("A2", np.nan), params_named.get("A1", np.nan)
+        params_named["sigma1_x"], params_named["sigma2_x"] = params_named.get("sigma2_x", np.nan), params_named.get("sigma1_x", np.nan)
+        params_named["sigma1_y"], params_named["sigma2_y"] = params_named.get("sigma2_y", np.nan), params_named.get("sigma1_y", np.nan)
+
+    return params_named
+
+
+def fit_elliptical_double_gaussian_image(
+    image,
+    sigma_hint=None,
+    center=None,
+    fit_center=False,
+    fit_background=False,
+    core_radius=2.0,
+    wing_radius=3.0,
+):
+    """Fit an elliptical double-Gaussian model with shared center and rotation."""
+    image = np.asarray(image, dtype=float)
+    ny, nx = image.shape
+    yy, xx = np.indices(image.shape)
+    coords = (xx.ravel(), yy.ravel())
+    data = image.ravel()
+
+    if center is None:
+        center = image_center(image)
+
+    guess = _edg_initial_guess(image, sigma_hint=sigma_hint, center=center)
+    sigma_upper = max(nx, ny)
+    theta_bounds = (-0.5 * np.pi, 0.5 * np.pi)
+
+    if fit_center and fit_background:
+        model_func = lambda xy, A1, x0_fit, y0_fit, s1x, s1y, A2, s2x, s2y, theta, B: elliptical_double_gaussian_2d(
+            xy, A1, x0_fit, y0_fit, s1x, s1y, A2, s2x, s2y, theta, B
+        )
+        p0 = [guess["A1"], guess["x0"], guess["y0"], guess["sigma1_x"], guess["sigma1_y"], guess["A2"], guess["sigma2_x"], guess["sigma2_y"], guess["theta"], guess["B"]]
+        bounds = (
+            [0.0, 0.0, 0.0, 0.05, 0.05, 0.0, 0.05, 0.05, theta_bounds[0], -0.1],
+            [np.inf, nx - 1.0, ny - 1.0, sigma_upper, sigma_upper, np.inf, sigma_upper, sigma_upper, theta_bounds[1], 0.1],
+        )
+        param_names = ["A1", "x0", "y0", "sigma1_x", "sigma1_y", "A2", "sigma2_x", "sigma2_y", "theta", "B"]
+    elif fit_center and not fit_background:
+        model_func = lambda xy, A1, x0_fit, y0_fit, s1x, s1y, A2, s2x, s2y, theta: elliptical_double_gaussian_2d(
+            xy, A1, x0_fit, y0_fit, s1x, s1y, A2, s2x, s2y, theta, 0.0
+        )
+        p0 = [guess["A1"], guess["x0"], guess["y0"], guess["sigma1_x"], guess["sigma1_y"], guess["A2"], guess["sigma2_x"], guess["sigma2_y"], guess["theta"]]
+        bounds = (
+            [0.0, 0.0, 0.0, 0.05, 0.05, 0.0, 0.05, 0.05, theta_bounds[0]],
+            [np.inf, nx - 1.0, ny - 1.0, sigma_upper, sigma_upper, np.inf, sigma_upper, sigma_upper, theta_bounds[1]],
+        )
+        param_names = ["A1", "x0", "y0", "sigma1_x", "sigma1_y", "A2", "sigma2_x", "sigma2_y", "theta"]
+    elif not fit_center and fit_background:
+        x0, y0 = center
+        model_func = lambda xy, A1, s1x, s1y, A2, s2x, s2y, theta, B: elliptical_double_gaussian_2d(
+            xy, A1, x0, y0, s1x, s1y, A2, s2x, s2y, theta, B
+        )
+        p0 = [guess["A1"], guess["sigma1_x"], guess["sigma1_y"], guess["A2"], guess["sigma2_x"], guess["sigma2_y"], guess["theta"], guess["B"]]
+        bounds = (
+            [0.0, 0.05, 0.05, 0.0, 0.05, 0.05, theta_bounds[0], -0.1],
+            [np.inf, sigma_upper, sigma_upper, np.inf, sigma_upper, sigma_upper, theta_bounds[1], 0.1],
+        )
+        param_names = ["A1", "sigma1_x", "sigma1_y", "A2", "sigma2_x", "sigma2_y", "theta", "B"]
+    else:
+        x0, y0 = center
+        model_func = lambda xy, A1, s1x, s1y, A2, s2x, s2y, theta: elliptical_double_gaussian_2d(
+            xy, A1, x0, y0, s1x, s1y, A2, s2x, s2y, theta, 0.0
+        )
+        p0 = [guess["A1"], guess["sigma1_x"], guess["sigma1_y"], guess["A2"], guess["sigma2_x"], guess["sigma2_y"], guess["theta"]]
+        bounds = (
+            [0.0, 0.05, 0.05, 0.0, 0.05, 0.05, theta_bounds[0]],
+            [np.inf, sigma_upper, sigma_upper, np.inf, sigma_upper, sigma_upper, theta_bounds[1]],
+        )
+        param_names = ["A1", "sigma1_x", "sigma1_y", "A2", "sigma2_x", "sigma2_y", "theta"]
+
+    fit = _run_curve_fit(model_func, coords, data, p0, bounds, maxfev=40000)
+    params_named = {name: float(value) for name, value in zip(param_names, fit["params"])}
+    params_named = _canonicalize_edg_params(params_named)
+    params_named.setdefault("A1", np.nan)
+    params_named.setdefault("sigma1_x", np.nan)
+    params_named.setdefault("sigma1_y", np.nan)
+    params_named.setdefault("A2", np.nan)
+    params_named.setdefault("sigma2_x", np.nan)
+    params_named.setdefault("sigma2_y", np.nan)
+    params_named.setdefault("theta", 0.0)
+
+    # Preserve fixed-center / fixed-background values explicitly so downstream
+    # master-table columns stay populated even when those terms were not fit.
+    if fit_center:
+        params_named.setdefault("x0", guess["x0"])
+        params_named.setdefault("y0", guess["y0"])
+    else:
+        params_named["x0"] = float(center[0])
+        params_named["y0"] = float(center[1])
+
+    if fit_background:
+        params_named.setdefault("B", guess["B"])
+    else:
+        params_named["B"] = 0.0
+
+    fit["params"] = np.array([params_named[name] for name in param_names], dtype=float)
+
+    if fit["fit_valid"]:
+        try:
+            model = model_func(coords, *fit["params"]).reshape(image.shape)
+        except Exception as exc:
+            fit["success"] = False
+            fit["fit_valid"] = False
+            fit["message"] = f"Model evaluation failed: {type(exc).__name__}: {exc}"
+            model = None
+    else:
+        model = None
+
+    return _finalize_fit_result(
+        image,
+        center,
+        fit["params"],
+        fit["cov"],
+        fit["success"],
+        fit["message"],
+        fit["fit_valid"],
+        model,
+        core_radius=core_radius,
+        wing_radius=wing_radius,
+        params_named=params_named,
+        nfev=fit["nfev"],
+    )
+
+
+############################################
+# 6. Gauss-Hermite
 ############################################
 
 
@@ -1037,6 +1323,7 @@ def pick_best_model(result):
     chi2_map = {
         "gaussian": _safe_chi2(result, "gaussian"),
         "double_gaussian": _safe_chi2(result, "dg"),
+        "elliptical_double_gaussian": _safe_chi2(result, "edg"),
         "gauss_hermite": _safe_chi2(result, "gh"),
         "moffat": _safe_chi2(result, "moffat"),
         "shapelet": _safe_chi2(result, "shapelet"),
@@ -1084,6 +1371,15 @@ def _analyze_psf_core(
         image,
         sigma_hint=sigma_hint,
         center=center,
+        core_radius=core_radius,
+        wing_radius=wing_radius,
+    )
+    edg = fit_elliptical_double_gaussian_image(
+        image,
+        sigma_hint=sigma_hint,
+        center=center,
+        fit_center=fit_center,
+        fit_background=fit_background,
         core_radius=core_radius,
         wing_radius=wing_radius,
     )
@@ -1163,6 +1459,22 @@ def _analyze_psf_core(
         "dg_profile_mse": dg["profile_mse"],
         "rp_dg": dg["rp_model"],
         "rp_dg_residual": dg["rp_residual"],
+        "edg_params": edg["params"],
+        "edg_params_named": edg["params_named"],
+        "edg_cov": edg["cov"],
+        "edg_array": edg["model"],
+        "edg_residual": edg["residual"],
+        "edg_chi2": edg["chi2"],
+        "edg_success": edg["success"],
+        "edg_message": edg["message"],
+        "edg_fit_valid": edg["fit_valid"],
+        "edg_metrics": edg["metrics"],
+        "edg_global_mse": edg["global_mse"],
+        "edg_core_mse": edg["core_mse"],
+        "edg_wing_mse": edg["wing_mse"],
+        "edg_profile_mse": edg["profile_mse"],
+        "rp_edg": edg["rp_model"],
+        "rp_edg_residual": edg["rp_residual"],
         "gh_params": gh["params"],
         "gh_params_named": gh["params_named"],
         "gh_cov": gh["cov"],
@@ -1220,6 +1532,10 @@ def _analyze_psf_core(
     result["delta_gaussian_vs_moffat"] = result["gaussian_chi2"] - result["moffat_chi2"]
     result["delta_gaussian_vs_gh"] = result["gaussian_chi2"] - result["gh_chi2"]
     result["delta_gaussian_vs_shapelet"] = result["gaussian_chi2"] - result["shapelet_chi2"]
+    result["delta_edg_vs_dg"] = result["edg_chi2"] - result["dg_chi2"]
+    result["delta_edg_vs_moffat"] = result["edg_chi2"] - result["moffat_chi2"]
+    result["delta_edg_vs_gh"] = result["edg_chi2"] - result["gh_chi2"]
+    result["delta_edg_vs_shapelet"] = result["edg_chi2"] - result["shapelet_chi2"]
 
     eps = 1e-30
     reference_candidates = []
@@ -1233,6 +1549,21 @@ def _analyze_psf_core(
         result["ng_score"] = np.log10((result["gaussian_chi2"] + eps) / (best_non_gaussian + eps))
     else:
         result["ng_score"] = np.nan
+
+    non_edg_candidates = []
+    for prefix in ["dg", "gh", "moffat", "shapelet"]:
+        if result.get(f"{prefix}_fit_valid", False):
+            non_edg_candidates.append(result[f"{prefix}_chi2"])
+
+    if result["edg_fit_valid"] and non_edg_candidates:
+        best_non_edg = min(non_edg_candidates)
+        edg_floor = 1e-8
+        raw_ratio = np.log10((result["edg_chi2"] + edg_floor) / (best_non_edg + edg_floor))
+        result["edg_deviation_score"] = max(0.0, raw_ratio)
+        result["best_non_edg_chi2"] = best_non_edg
+    else:
+        result["edg_deviation_score"] = np.nan
+        result["best_non_edg_chi2"] = np.nan
 
     return result
 
@@ -1297,6 +1628,7 @@ def print_available_chi2(result):
     lines = [
         ("Gaussian", result["gaussian_chi2"], result["gaussian_fit_valid"], result["gaussian_message"]),
         ("Double Gaussian", result["dg_chi2"], result["dg_fit_valid"], result["dg_message"]),
+        ("Elliptical DG", result["edg_chi2"], result["edg_fit_valid"], result["edg_message"]),
         ("Gauss-Hermite", result["gh_chi2"], result["gh_fit_valid"], result["gh_message"]),
         ("Moffat", result["moffat_chi2"], result["moffat_fit_valid"], result["moffat_message"]),
         ("Shapelet", result["shapelet_chi2"], result["shapelet_fit_valid"], result["shapelet_message"]),
@@ -1310,6 +1642,7 @@ def print_available_chi2(result):
 
     print(f"Best model: {result['best_model']}")
     print(f"Non-Gaussian score: {result['ng_score']:.4f}")
+    print(f"EDG deviation score: {result['edg_deviation_score']:.4f}")
 
 
 def build_reference_metric_row(case_name, deviation_type, result):
@@ -1320,15 +1653,18 @@ def build_reference_metric_row(case_name, deviation_type, result):
         "best_model": result.get("best_model"),
         "gaussian_chi2": result.get("gaussian_chi2"),
         "dg_chi2": result.get("dg_chi2"),
+        "edg_chi2": result.get("edg_chi2"),
         "gh_chi2": result.get("gh_chi2"),
         "moffat_chi2": result.get("moffat_chi2"),
         "shapelet_chi2": result.get("shapelet_chi2"),
         "ng_score": result.get("ng_score"),
+        "edg_deviation_score": result.get("edg_deviation_score"),
         "ellipticity": result.get("ellipticity"),
         "fwhm_proxy": result.get("fwhm_proxy"),
         "ee80_radius": result.get("ee80_radius"),
         "gaussian_wing_mse": result.get("gaussian_wing_mse"),
         "dg_wing_mse": result.get("dg_wing_mse"),
+        "edg_wing_mse": result.get("edg_wing_mse"),
         "moffat_wing_mse": result.get("moffat_wing_mse"),
     }
 
@@ -1377,23 +1713,28 @@ def build_summary_row(case, result):
         "deviation_type": case["deviation_type"],
         "gaussian_chi2": result["gaussian_chi2"],
         "dg_chi2": result["dg_chi2"],
+        "edg_chi2": result["edg_chi2"],
         "gh_chi2": result["gh_chi2"],
         "moffat_chi2": result["moffat_chi2"],
         "shapelet_chi2": result["shapelet_chi2"],
         "gaussian_core_mse": result["gaussian_core_mse"],
         "gaussian_wing_mse": result["gaussian_wing_mse"],
         "dg_wing_mse": result["dg_wing_mse"],
+        "edg_wing_mse": result["edg_wing_mse"],
         "moffat_wing_mse": result["moffat_wing_mse"],
         "gaussian_profile_mse": result["gaussian_profile_mse"],
         "dg_profile_mse": result["dg_profile_mse"],
+        "edg_profile_mse": result["edg_profile_mse"],
         "moffat_profile_mse": result["moffat_profile_mse"],
         "gaussian_fit_valid": result["gaussian_fit_valid"],
         "dg_fit_valid": result["dg_fit_valid"],
+        "edg_fit_valid": result["edg_fit_valid"],
         "gh_fit_valid": result["gh_fit_valid"],
         "moffat_fit_valid": result["moffat_fit_valid"],
         "shapelet_fit_valid": result["shapelet_fit_valid"],
         "gaussian_message": result["gaussian_message"],
         "dg_message": result["dg_message"],
+        "edg_message": result["edg_message"],
         "gh_message": result["gh_message"],
         "moffat_message": result["moffat_message"],
         "shapelet_message": result["shapelet_message"],
@@ -1401,7 +1742,12 @@ def build_summary_row(case, result):
         "delta_gaussian_vs_moffat": result["delta_gaussian_vs_moffat"],
         "delta_gaussian_vs_gh": result["delta_gaussian_vs_gh"],
         "delta_gaussian_vs_shapelet": result["delta_gaussian_vs_shapelet"],
+        "delta_edg_vs_dg": result["delta_edg_vs_dg"],
+        "delta_edg_vs_moffat": result["delta_edg_vs_moffat"],
+        "delta_edg_vs_gh": result["delta_edg_vs_gh"],
+        "delta_edg_vs_shapelet": result["delta_edg_vs_shapelet"],
         "ng_score": result["ng_score"],
+        "edg_deviation_score": result["edg_deviation_score"],
         "best_model": result["best_model"],
     }
 
@@ -1457,6 +1803,7 @@ def run_heavy_wing_parameter_scan(
                     "wing_scale": wing_scale,
                     "gaussian_chi2": result["gaussian_chi2"],
                     "dg_chi2": result["dg_chi2"],
+                    "edg_chi2": result["edg_chi2"],
                     "gh_chi2": result["gh_chi2"],
                     "moffat_chi2": result["moffat_chi2"],
                     "shapelet_chi2": result["shapelet_chi2"],
@@ -1466,6 +1813,9 @@ def run_heavy_wing_parameter_scan(
                     "dg_core_mse": result["dg_core_mse"],
                     "dg_wing_mse": result["dg_wing_mse"],
                     "dg_profile_mse": result["dg_profile_mse"],
+                    "edg_core_mse": result["edg_core_mse"],
+                    "edg_wing_mse": result["edg_wing_mse"],
+                    "edg_profile_mse": result["edg_profile_mse"],
                     "moffat_core_mse": result["moffat_core_mse"],
                     "moffat_wing_mse": result["moffat_wing_mse"],
                     "moffat_profile_mse": result["moffat_profile_mse"],
@@ -1475,13 +1825,17 @@ def run_heavy_wing_parameter_scan(
                     "shapelet_wing_mse": result["shapelet_wing_mse"],
                     "gaussian_fit_valid": result["gaussian_fit_valid"],
                     "dg_fit_valid": result["dg_fit_valid"],
+                    "edg_fit_valid": result["edg_fit_valid"],
                     "gh_fit_valid": result["gh_fit_valid"],
                     "moffat_fit_valid": result["moffat_fit_valid"],
                     "shapelet_fit_valid": result["shapelet_fit_valid"],
                     "best_model": result["best_model"],
                     "ng_score": result["ng_score"],
+                    "edg_deviation_score": result["edg_deviation_score"],
                     "delta_gaussian_vs_dg": result["delta_gaussian_vs_dg"],
                     "delta_gaussian_vs_moffat": result["delta_gaussian_vs_moffat"],
+                    "delta_edg_vs_dg": result["delta_edg_vs_dg"],
+                    "delta_edg_vs_moffat": result["delta_edg_vs_moffat"],
                 }
             )
 
@@ -1501,6 +1855,7 @@ def plot_case_profiles(result, case_title, log_y=False):
         ("input", result["rp_psf"], "k", "o"),
         ("Gaussian", result["rp_gaussian"], MODEL_COLORS["gaussian"], MODEL_MARKERS["gaussian"]),
         ("Double Gaussian", result["rp_dg"], MODEL_COLORS["double_gaussian"], MODEL_MARKERS["double_gaussian"]),
+        ("Elliptical DG", result["rp_edg"], MODEL_COLORS["elliptical_double_gaussian"], MODEL_MARKERS["elliptical_double_gaussian"]),
         ("Gauss-Hermite", result["rp_gh"], MODEL_COLORS["gauss_hermite"], MODEL_MARKERS["gauss_hermite"]),
         ("Moffat", result["rp_moffat"], MODEL_COLORS["moffat"], MODEL_MARKERS["moffat"]),
         ("Shapelet", result["rp_shapelet"], MODEL_COLORS["shapelet"], MODEL_MARKERS["shapelet"]),
@@ -1519,6 +1874,7 @@ def plot_case_profiles(result, case_title, log_y=False):
     residual_series = [
         ("input - Gaussian", result["rp_gaussian_residual"], MODEL_COLORS["gaussian"], MODEL_MARKERS["gaussian"]),
         ("input - DG", result["rp_dg_residual"], MODEL_COLORS["double_gaussian"], MODEL_MARKERS["double_gaussian"]),
+        ("input - EDG", result["rp_edg_residual"], MODEL_COLORS["elliptical_double_gaussian"], MODEL_MARKERS["elliptical_double_gaussian"]),
         ("input - GH", result["rp_gh_residual"], MODEL_COLORS["gauss_hermite"], MODEL_MARKERS["gauss_hermite"]),
         ("input - Moffat", result["rp_moffat_residual"], MODEL_COLORS["moffat"], MODEL_MARKERS["moffat"]),
         ("input - Shapelet", result["rp_shapelet_residual"], MODEL_COLORS["shapelet"], MODEL_MARKERS["shapelet"]),
@@ -1541,7 +1897,7 @@ def plot_residual_comparison(result, case_title):
     """Show the input image and the residual image for each model."""
     max_val = np.nanmax(np.abs(result["psf_array"]))
 
-    fig, axes = plt.subplots(1, 6, figsize=(21, 3.6))
+    fig, axes = plt.subplots(1, 7, figsize=(24, 3.6))
 
     im0 = axes[0].imshow(result["psf_array"], cmap="viridis", vmin=0, vmax=max_val)
     axes[0].set_title(f"Input\n{case_title}")
@@ -1550,6 +1906,7 @@ def plot_residual_comparison(result, case_title):
     residual_items = [
         ("Gaussian", result["gaussian_residual"], result["gaussian_chi2"], result["gaussian_fit_valid"]),
         ("DG", result["dg_residual"], result["dg_chi2"], result["dg_fit_valid"]),
+        ("EDG", result["edg_residual"], result["edg_chi2"], result["edg_fit_valid"]),
         ("GH", result["gh_residual"], result["gh_chi2"], result["gh_fit_valid"]),
         ("Moffat", result["moffat_residual"], result["moffat_chi2"], result["moffat_fit_valid"]),
         ("Shapelet", result["shapelet_residual"], result["shapelet_chi2"], result["shapelet_fit_valid"]),
@@ -1582,6 +1939,7 @@ def plot_chi_summary(summary_df):
     chi_plot_map = {
         "gaussian_chi2": "Gaussian",
         "dg_chi2": "Double Gaussian",
+        "edg_chi2": "Elliptical Double Gaussian",
         "gh_chi2": "Gauss-Hermite",
         "moffat_chi2": "Moffat",
         "shapelet_chi2": "Shapelet",
@@ -1589,14 +1947,21 @@ def plot_chi_summary(summary_df):
 
     fig, ax = plt.subplots(figsize=(10, 4.5))
     for col, label in chi_plot_map.items():
-        model_key = col.replace("_chi2", "")
+        model_key = {
+            "gaussian_chi2": "gaussian",
+            "dg_chi2": "double_gaussian",
+            "edg_chi2": "elliptical_double_gaussian",
+            "gh_chi2": "gauss_hermite",
+            "moffat_chi2": "moffat",
+            "shapelet_chi2": "shapelet",
+        }[col]
         ax.plot(
             summary_df["case_name"],
             summary_df[col],
-            marker=MODEL_MARKERS[model_key if model_key in MODEL_MARKERS else "gaussian"],
+            marker=MODEL_MARKERS[model_key],
             lw=1.5,
             label=label,
-            color=MODEL_COLORS[model_key if model_key in MODEL_COLORS else "gaussian"],
+            color=MODEL_COLORS[model_key],
         )
 
     ax.set_yscale("log")

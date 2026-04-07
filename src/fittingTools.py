@@ -24,6 +24,7 @@ from simulationTools import (
     compute_second_moment_shape,
     count_best_models,
     fit_double_gaussian_image as _fit_double_gaussian_image,
+    fit_elliptical_double_gaussian_image as _fit_elliptical_double_gaussian_image,
     fit_gauss_hermite as _fit_gauss_hermite,
     fit_gauss_hermite_image as _fit_gauss_hermite_image,
     fit_gaussian_image as _fit_gaussian_image,
@@ -38,6 +39,7 @@ _PLOT_DPI = 72
 SCIENCE_BAD_STAR_Z_THRESHOLD = 2.5
 DETECTOR_FAILURE_FRACTION_THRESHOLD = 0.25
 HIGH_NG_SCORE_THRESHOLD = 0.5
+HIGH_EDG_DEVIATION_SCORE_THRESHOLD = 0.15
 
 
 ############################################
@@ -53,6 +55,11 @@ def fit_gaussian_image(*args, **kwargs):
 def fit_double_gaussian_image(*args, **kwargs):
     """Reuse the Double Gaussian fit helper from simulationTools."""
     return _fit_double_gaussian_image(*args, **kwargs)
+
+
+def fit_elliptical_double_gaussian_image(*args, **kwargs):
+    """Reuse the EDG fit helper from simulationTools."""
+    return _fit_elliptical_double_gaussian_image(*args, **kwargs)
 
 
 def fit_gauss_hermite(image, center=None, **kwargs):
@@ -298,11 +305,18 @@ def _empty_model_analysis(center):
         "best_model": "none",
         "chi2_map": {},
         "ng_score": np.nan,
+        "edg_deviation_score": np.nan,
+        "best_non_edg_chi2": np.nan,
+        "delta_edg_vs_dg": np.nan,
+        "delta_edg_vs_moffat": np.nan,
+        "delta_edg_vs_gh": np.nan,
+        "delta_edg_vs_shapelet": np.nan,
     }
 
     for prefix, array_key in [
         ("gaussian", "gaussian_array"),
         ("dg", "dgauss_array"),
+        ("edg", "edg_array"),
         ("gh", "gh_array"),
         ("moffat", "moffat_array"),
         ("shapelet", "shapelet_array"),
@@ -450,9 +464,93 @@ def analyze_psf_models(
 ############################################
 
 
+def _named_param(params_named, key):
+    """Return one scalar named fit parameter or NaN when unavailable."""
+    if not params_named:
+        return np.nan
+    value = params_named.get(key, np.nan)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return np.nan
+
+
+def _shapelet_order_norm_summary(shapelet_result, max_order=4):
+    """Summarize shapelet coefficients by total order with compact L2 norms."""
+    summary = {f"shapelet_order{order}_norm": np.nan for order in range(max_order + 1)}
+    summary["shapelet_coeff_l2_total"] = np.nan
+
+    if not shapelet_result:
+        return summary
+
+    coeffs = np.asarray(shapelet_result.get("coeffs", []), dtype=float)
+    modes = shapelet_result.get("modes", [])
+    if coeffs.size == 0 or len(modes) == 0 or len(coeffs) != len(modes):
+        return summary
+
+    summary["shapelet_coeff_l2_total"] = float(np.linalg.norm(coeffs))
+    order_groups = summarize_coefficients(coeffs, modes)
+    for order in range(max_order + 1):
+        coeff_group = order_groups.get(order)
+        summary[f"shapelet_order{order}_norm"] = (
+            float(np.linalg.norm(coeff_group)) if coeff_group is not None else 0.0
+        )
+    return summary
+
+
+def _flatten_model_parameter_columns(result_dict):
+    """Flatten per-model scalar parameters for the star master table."""
+    gaussian_params = result_dict.get("gaussian_params_named", {}) or {}
+    dg_params = result_dict.get("dg_params_named", {}) or {}
+    edg_params = result_dict.get("edg_params_named", {}) or {}
+    gh_params = result_dict.get("gh_params_named", {}) or {}
+    moffat_params = result_dict.get("moffat_params_named", {}) or {}
+    shapelet_params = result_dict.get("shapelet_params_named", {}) or {}
+
+    return {
+        "gaussian_A": _named_param(gaussian_params, "A"),
+        "gaussian_sigma": _named_param(gaussian_params, "sigma"),
+        "gaussian_x0": _named_param(gaussian_params, "x0"),
+        "gaussian_y0": _named_param(gaussian_params, "y0"),
+        "gaussian_B": _named_param(gaussian_params, "B"),
+        "dg_a1": _named_param(dg_params, "a1"),
+        "dg_sigma1": _named_param(dg_params, "sigma1"),
+        "dg_a2": _named_param(dg_params, "a2"),
+        "dg_sigma2": _named_param(dg_params, "sigma2"),
+        "edg_A1": _named_param(edg_params, "A1"),
+        "edg_sigma1_x": _named_param(edg_params, "sigma1_x"),
+        "edg_sigma1_y": _named_param(edg_params, "sigma1_y"),
+        "edg_A2": _named_param(edg_params, "A2"),
+        "edg_sigma2_x": _named_param(edg_params, "sigma2_x"),
+        "edg_sigma2_y": _named_param(edg_params, "sigma2_y"),
+        "edg_theta": _named_param(edg_params, "theta"),
+        "edg_x0": _named_param(edg_params, "x0"),
+        "edg_y0": _named_param(edg_params, "y0"),
+        "edg_B": _named_param(edg_params, "B"),
+        "gh_A": _named_param(gh_params, "A"),
+        "gh_x0": _named_param(gh_params, "x0"),
+        "gh_y0": _named_param(gh_params, "y0"),
+        "gh_sigma_x": _named_param(gh_params, "sigma_x"),
+        "gh_sigma_y": _named_param(gh_params, "sigma_y"),
+        "gh_h3x": _named_param(gh_params, "h3x"),
+        "gh_h4x": _named_param(gh_params, "h4x"),
+        "gh_h3y": _named_param(gh_params, "h3y"),
+        "gh_h4y": _named_param(gh_params, "h4y"),
+        "gh_B": _named_param(gh_params, "B"),
+        "moffat_A": _named_param(moffat_params, "A"),
+        "moffat_x0": _named_param(moffat_params, "x0"),
+        "moffat_y0": _named_param(moffat_params, "y0"),
+        "moffat_alpha": _named_param(moffat_params, "alpha"),
+        "moffat_beta": _named_param(moffat_params, "beta"),
+        "moffat_B": _named_param(moffat_params, "B"),
+        "shapelet_beta": _named_param(shapelet_params, "beta"),
+        "shapelet_nmax": _named_param(shapelet_params, "nmax"),
+    }
+
+
 def build_star_summary_row(result_dict):
     """Build one row for a star-level metrics table."""
-    return {
+    row = {
         "sourceId": result_dict.get("sourceId"),
         "visit": result_dict.get("visit"),
         "detector": result_dict.get("detector"),
@@ -469,6 +567,7 @@ def build_star_summary_row(result_dict):
         "ellipticity": result_dict.get("ellipticity"),
         "gaussian_chi2": result_dict.get("gaussian_chi2"),
         "dg_chi2": result_dict.get("dg_chi2"),
+        "edg_chi2": result_dict.get("edg_chi2"),
         "gh_chi2": result_dict.get("gh_chi2"),
         "moffat_chi2": result_dict.get("moffat_chi2"),
         "shapelet_chi2": result_dict.get("shapelet_chi2"),
@@ -478,20 +577,30 @@ def build_star_summary_row(result_dict):
         "dg_core_mse": result_dict.get("dg_core_mse"),
         "dg_wing_mse": result_dict.get("dg_wing_mse"),
         "dg_profile_mse": result_dict.get("dg_profile_mse"),
+        "edg_core_mse": result_dict.get("edg_core_mse"),
+        "edg_wing_mse": result_dict.get("edg_wing_mse"),
+        "edg_profile_mse": result_dict.get("edg_profile_mse"),
         "moffat_core_mse": result_dict.get("moffat_core_mse"),
         "moffat_wing_mse": result_dict.get("moffat_wing_mse"),
         "moffat_profile_mse": result_dict.get("moffat_profile_mse"),
         "delta_gaussian_vs_dg": result_dict.get("delta_gaussian_vs_dg"),
         "delta_gaussian_vs_moffat": result_dict.get("delta_gaussian_vs_moffat"),
+        "delta_edg_vs_dg": result_dict.get("delta_edg_vs_dg"),
+        "delta_edg_vs_moffat": result_dict.get("delta_edg_vs_moffat"),
+        "delta_edg_vs_gh": result_dict.get("delta_edg_vs_gh"),
+        "delta_edg_vs_shapelet": result_dict.get("delta_edg_vs_shapelet"),
         "ng_score": result_dict.get("ng_score"),
+        "edg_deviation_score": result_dict.get("edg_deviation_score"),
         "best_model": result_dict.get("best_model"),
         "gaussian_fit_valid": result_dict.get("gaussian_fit_valid"),
         "dg_fit_valid": result_dict.get("dg_fit_valid"),
+        "edg_fit_valid": result_dict.get("edg_fit_valid"),
         "gh_fit_valid": result_dict.get("gh_fit_valid"),
         "moffat_fit_valid": result_dict.get("moffat_fit_valid"),
         "shapelet_fit_valid": result_dict.get("shapelet_fit_valid"),
         "gaussian_message": result_dict.get("gaussian_message"),
         "dg_message": result_dict.get("dg_message"),
+        "edg_message": result_dict.get("edg_message"),
         "gh_message": result_dict.get("gh_message"),
         "moffat_message": result_dict.get("moffat_message"),
         "shapelet_message": result_dict.get("shapelet_message"),
@@ -500,8 +609,68 @@ def build_star_summary_row(result_dict):
         "failed_star_flag": result_dict.get("failed_star_flag"),
         "science_bad_star_flag": result_dict.get("science_bad_star_flag"),
         "high_ng_star_flag": result_dict.get("high_ng_star_flag"),
+        "high_edg_deviation_star_flag": result_dict.get("high_edg_deviation_star_flag"),
         "background_estimate": result_dict.get("background_estimate"),
     }
+
+    row.update(_flatten_model_parameter_columns(result_dict))
+    row.update(_shapelet_order_norm_summary(result_dict.get("shapelet_result")))
+    return row
+
+
+def build_shapelet_coefficients_long_table(results_or_star_rows):
+    """
+    Build a long-format shapelet coefficient table from analysis results.
+
+    The intended input is the raw `analysis_results` list from the notebook so
+    the full coefficient vectors can live in a sidecar table instead of the
+    master star table.
+    """
+    if isinstance(results_or_star_rows, pd.DataFrame):
+        records = results_or_star_rows.to_dict("records")
+    else:
+        records = list(results_or_star_rows or [])
+
+    rows = []
+    for record in records:
+        shapelet_result = record.get("shapelet_result")
+        if not shapelet_result:
+            continue
+
+        coeffs = np.asarray(shapelet_result.get("coeffs", []), dtype=float)
+        modes = shapelet_result.get("modes", [])
+        if coeffs.size == 0 or len(modes) == 0:
+            continue
+
+        for mode_index, ((n1, n2), coeff) in enumerate(zip(modes, coeffs)):
+            rows.append(
+                {
+                    "sourceId": record.get("sourceId"),
+                    "visit": record.get("visit"),
+                    "detector": record.get("detector"),
+                    "band": record.get("band"),
+                    "day_obs": record.get("day_obs"),
+                    "mode_index": int(mode_index),
+                    "n1": int(n1),
+                    "n2": int(n2),
+                    "coeff": float(coeff),
+                }
+            )
+
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "sourceId",
+            "visit",
+            "detector",
+            "band",
+            "day_obs",
+            "mode_index",
+            "n1",
+            "n2",
+            "coeff",
+        ],
+    )
 
 
 def compute_robust_zscore(series):
@@ -528,6 +697,7 @@ def annotate_star_quality(
     star_df,
     science_bad_z_threshold=SCIENCE_BAD_STAR_Z_THRESHOLD,
     high_ng_score_threshold=HIGH_NG_SCORE_THRESHOLD,
+    high_edg_deviation_score_threshold=HIGH_EDG_DEVIATION_SCORE_THRESHOLD,
 ):
     """
     Add star-level failure and science-bad flags using one-sided robust excursions.
@@ -540,6 +710,7 @@ def annotate_star_quality(
         out["failed_star_flag"] = pd.Series(dtype=bool)
         out["science_bad_star_flag"] = pd.Series(dtype=bool)
         out["high_ng_star_flag"] = pd.Series(dtype=bool)
+        out["high_edg_deviation_star_flag"] = pd.Series(dtype=bool)
         return out
 
     preprocess_ok = out.get("preprocess_valid", pd.Series(True, index=out.index)).fillna(False)
@@ -549,6 +720,10 @@ def annotate_star_quality(
     out["failed_star_flag"] = (~preprocess_ok) | (~analysis_ok) | (best_model == "none")
     out["high_ng_star_flag"] = (
         out.get("ng_score", pd.Series(np.nan, index=out.index)).fillna(-np.inf) >= high_ng_score_threshold
+    ) & (~out["failed_star_flag"])
+    out["high_edg_deviation_star_flag"] = (
+        out.get("edg_deviation_score", pd.Series(np.nan, index=out.index)).fillna(-np.inf)
+        >= high_edg_deviation_score_threshold
     ) & (~out["failed_star_flag"])
 
     metric_map = {
@@ -564,6 +739,13 @@ def annotate_star_quality(
             out[z_col] = z
         else:
             out[z_col] = np.nan
+
+    if "edg_deviation_score" in out.columns:
+        z = _positive_robust_excursion(out["edg_deviation_score"])
+        z[out["failed_star_flag"]] = np.nan
+        out["edg_deviation_score_bad_z"] = z
+    else:
+        out["edg_deviation_score_bad_z"] = np.nan
 
     bad_z_cols = list(metric_map.values())
     science_bad = pd.Series(False, index=out.index)
@@ -588,6 +770,7 @@ def compute_visit_badness(df, score_col=None):
     size_cols = [col for col in ["median_fwhm_proxy", "median_ee80_radius", "median_detector_fwhm", "median_detector_ee80"] if col in out.columns]
     shape_cols = [col for col in ["median_ellipticity", "median_detector_ellipticity"] if col in out.columns]
     ng_cols = [col for col in ["median_ng_score", "median_detector_ng_score"] if col in out.columns]
+    edg_cols = [col for col in ["median_edg_deviation_score"] if col in out.columns]
     spatial_cols = [col for col in ["detector_fwhm_spread", "detector_ellipticity_spread"] if col in out.columns]
     failure_cols = [col for col in ["frac_failed_stars", "frac_failed_detectors"] if col in out.columns]
 
@@ -609,6 +792,12 @@ def compute_visit_badness(df, score_col=None):
     else:
         out["non_gaussian_excursion"] = 0.0
 
+    if edg_cols:
+        z = np.column_stack([_positive_robust_excursion(out[col]).to_numpy() for col in edg_cols])
+        out["edg_deviation_excursion"] = np.nanmean(z, axis=1)
+    else:
+        out["edg_deviation_excursion"] = 0.0
+
     if spatial_cols:
         z = np.column_stack([_positive_robust_excursion(out[col]).to_numpy() for col in spatial_cols])
         out["spatial_nonuniformity"] = np.nanmean(z, axis=1)
@@ -626,6 +815,7 @@ def compute_visit_badness(df, score_col=None):
         + out["shape_excursion"]
         + out["non_gaussian_excursion"]
         + out["spatial_nonuniformity"]
+        + out["edg_deviation_excursion"]
     )
 
     if score_col == "detector_badness":
@@ -649,14 +839,18 @@ def summarize_detector_metrics(star_df):
                 "median_ee80_radius",
                 "median_ellipticity",
                 "median_ng_score",
+                "median_edg_deviation_score",
                 "n_failed_stars",
                 "frac_failed_stars",
                 "n_science_bad_stars",
                 "frac_science_bad_stars",
                 "n_high_ng_stars",
                 "frac_high_ng_stars",
+                "n_high_edg_deviation_stars",
+                "frac_high_edg_deviation_stars",
                 "detector_fwhm_spread",
                 "detector_ellipticity_spread",
+                "edg_deviation_excursion",
                 "detector_badness",
             ]
         )
@@ -672,6 +866,7 @@ def summarize_detector_metrics(star_df):
         row["median_ee80_radius"] = group["ee80_radius"].median(skipna=True)
         row["median_ellipticity"] = group["ellipticity"].median(skipna=True)
         row["median_ng_score"] = group["ng_score"].median(skipna=True)
+        row["median_edg_deviation_score"] = group["edg_deviation_score"].median(skipna=True)
         row["detector_fwhm_spread"] = group["fwhm_proxy"].quantile(0.9) - group["fwhm_proxy"].quantile(0.1)
         row["detector_ellipticity_spread"] = group["ellipticity"].quantile(0.9) - group["ellipticity"].quantile(0.1)
         row["n_failed_stars"] = int(group["failed_star_flag"].sum())
@@ -680,6 +875,8 @@ def summarize_detector_metrics(star_df):
         row["frac_science_bad_stars"] = float(group["science_bad_star_flag"].mean()) if len(group) > 0 else np.nan
         row["n_high_ng_stars"] = int(group["high_ng_star_flag"].sum())
         row["frac_high_ng_stars"] = float(group["high_ng_star_flag"].mean()) if len(group) > 0 else np.nan
+        row["n_high_edg_deviation_stars"] = int(group["high_edg_deviation_star_flag"].sum())
+        row["frac_high_edg_deviation_stars"] = float(group["high_edg_deviation_star_flag"].mean()) if len(group) > 0 else np.nan
         rows.append(row)
 
     detector_df = pd.DataFrame(rows)
@@ -687,6 +884,7 @@ def summarize_detector_metrics(star_df):
     detector_df["detector_failed_flag"] = detector_df["frac_failed_stars"].fillna(0) > DETECTOR_FAILURE_FRACTION_THRESHOLD
     detector_df["detector_science_bad_flag"] = detector_df["detector_bad_flag"].fillna(False)
     detector_df["detector_high_ng_flag"] = detector_df["frac_high_ng_stars"].fillna(0) > 0
+    detector_df["detector_high_edg_deviation_flag"] = detector_df["frac_high_edg_deviation_stars"].fillna(0) > 0
     return detector_df
 
 
@@ -708,6 +906,7 @@ def summarize_visit_metrics(detector_df):
                 "p90_detector_ellipticity",
                 "detector_ellipticity_spread",
                 "median_detector_ng_score",
+                "median_edg_deviation_score",
                 "n_failed_detectors",
                 "frac_failed_detectors",
                 "n_science_bad_detectors",
@@ -716,9 +915,14 @@ def summarize_visit_metrics(detector_df):
                 "frac_high_ng_detectors",
                 "n_high_ng_stars",
                 "frac_high_ng_stars",
+                "n_high_edg_deviation_detectors",
+                "frac_high_edg_deviation_detectors",
+                "n_high_edg_deviation_stars",
+                "frac_high_edg_deviation_stars",
                 "size_excursion",
                 "shape_excursion",
                 "non_gaussian_excursion",
+                "edg_deviation_excursion",
                 "spatial_nonuniformity",
                 "qa_failure_excursion",
                 "visit_badness",
@@ -743,6 +947,7 @@ def summarize_visit_metrics(detector_df):
         row["p90_detector_ellipticity"] = group["median_ellipticity"].quantile(0.9)
         row["detector_ellipticity_spread"] = group["median_ellipticity"].quantile(0.9) - group["median_ellipticity"].quantile(0.1)
         row["median_detector_ng_score"] = group["median_ng_score"].median(skipna=True)
+        row["median_edg_deviation_score"] = group["median_edg_deviation_score"].median(skipna=True)
         row["n_failed_detectors"] = int(group["detector_failed_flag"].sum()) if "detector_failed_flag" in group else 0
         row["frac_failed_detectors"] = float(group["detector_failed_flag"].mean()) if "detector_failed_flag" in group else np.nan
         row["n_science_bad_detectors"] = int(group["detector_science_bad_flag"].sum()) if "detector_science_bad_flag" in group else 0
@@ -752,6 +957,14 @@ def summarize_visit_metrics(detector_df):
         row["n_high_ng_stars"] = int(group["n_high_ng_stars"].sum()) if "n_high_ng_stars" in group else 0
         row["frac_high_ng_stars"] = (
             row["n_high_ng_stars"] / row["n_stars"] if row["n_stars"] > 0 else np.nan
+        )
+        row["n_high_edg_deviation_detectors"] = int(group["detector_high_edg_deviation_flag"].sum()) if "detector_high_edg_deviation_flag" in group else 0
+        row["frac_high_edg_deviation_detectors"] = (
+            float(group["detector_high_edg_deviation_flag"].mean()) if "detector_high_edg_deviation_flag" in group else np.nan
+        )
+        row["n_high_edg_deviation_stars"] = int(group["n_high_edg_deviation_stars"].sum()) if "n_high_edg_deviation_stars" in group else 0
+        row["frac_high_edg_deviation_stars"] = (
+            row["n_high_edg_deviation_stars"] / row["n_stars"] if row["n_stars"] > 0 else np.nan
         )
         rows.append(row)
 
@@ -798,11 +1011,14 @@ def build_known_visit_validation_table(
                 "size_excursion",
                 "shape_excursion",
                 "non_gaussian_excursion",
+                "edg_deviation_excursion",
                 "spatial_nonuniformity",
                 "frac_failed_detectors",
                 "frac_science_bad_detectors",
                 "frac_high_ng_detectors",
                 "frac_high_ng_stars",
+                "frac_high_edg_deviation_detectors",
+                "frac_high_edg_deviation_stars",
             ]
         )
 
@@ -816,15 +1032,18 @@ def build_known_visit_validation_table(
             "bad_visit_flag",
             "size_excursion",
             "shape_excursion",
-            "non_gaussian_excursion",
-            "spatial_nonuniformity",
-            "frac_failed_detectors",
-            "frac_science_bad_detectors",
-            "frac_high_ng_detectors",
-            "frac_high_ng_stars",
-            "n_detectors",
-            "n_stars",
-        ]
+                "non_gaussian_excursion",
+                "edg_deviation_excursion",
+                "spatial_nonuniformity",
+                "frac_failed_detectors",
+                "frac_science_bad_detectors",
+                "frac_high_ng_detectors",
+                "frac_high_ng_stars",
+                "frac_high_edg_deviation_detectors",
+                "frac_high_edg_deviation_stars",
+                "n_detectors",
+                "n_stars",
+            ]
         if col in visit_df.columns
     ]
 
@@ -843,9 +1062,9 @@ def build_night_summary_table(visit_df):
     """
     Build one compact row per day_obs for advisor-facing screening summaries.
 
-    The `frac_visits_with_high_ng` column uses a practical first-pass definition:
-    a visit counts as high-ng if any sampled star or detector crosses the
-    high-ng screening flag.
+    The `frac_visits_with_high_ng` and `frac_visits_with_high_edg_deviation`
+    columns use a practical first-pass definition: a visit counts as high if
+    any sampled star or detector crosses the corresponding screening flag.
     """
     if visit_df.empty:
         return pd.DataFrame(
@@ -858,8 +1077,10 @@ def build_night_summary_table(visit_df):
                 "median_size_excursion",
                 "median_shape_excursion",
                 "median_non_gaussian_excursion",
+                "median_edg_deviation_excursion",
                 "median_spatial_nonuniformity",
                 "frac_visits_with_high_ng",
+                "frac_visits_with_high_edg_deviation",
             ]
         )
 
@@ -869,6 +1090,11 @@ def build_night_summary_table(visit_df):
             group.get("frac_high_ng_stars", pd.Series(0.0, index=group.index)).fillna(0) > 0
         ) | (
             group.get("frac_high_ng_detectors", pd.Series(0.0, index=group.index)).fillna(0) > 0
+        )
+        visit_has_high_edg = (
+            group.get("frac_high_edg_deviation_stars", pd.Series(0.0, index=group.index)).fillna(0) > 0
+        ) | (
+            group.get("frac_high_edg_deviation_detectors", pd.Series(0.0, index=group.index)).fillna(0) > 0
         )
 
         rows.append(
@@ -881,8 +1107,10 @@ def build_night_summary_table(visit_df):
                 "median_size_excursion": float(group["size_excursion"].median(skipna=True)),
                 "median_shape_excursion": float(group["shape_excursion"].median(skipna=True)),
                 "median_non_gaussian_excursion": float(group["non_gaussian_excursion"].median(skipna=True)),
+                "median_edg_deviation_excursion": float(group["edg_deviation_excursion"].median(skipna=True)),
                 "median_spatial_nonuniformity": float(group["spatial_nonuniformity"].median(skipna=True)),
                 "frac_visits_with_high_ng": float(visit_has_high_ng.mean()) if len(group) > 0 else np.nan,
+                "frac_visits_with_high_edg_deviation": float(visit_has_high_edg.mean()) if len(group) > 0 else np.nan,
             }
         )
 
@@ -932,7 +1160,7 @@ def plot_model_comparison_page(results, start, page_size, visit_id, detector_id,
     if n <= 0:
         return
 
-    fig, axes = plt.subplots(n, 13, figsize=(48, 4.5 * n))
+    fig, axes = plt.subplots(n, 15, figsize=(56, 4.5 * n))
     if n == 1:
         axes = axes[np.newaxis, :]
 
@@ -946,6 +1174,7 @@ def plot_model_comparison_page(results, start, page_size, visit_id, detector_id,
     model_specs = [
         ("Gaussian", "gaussian_array", "gaussian_residual", "gaussian_chi2", "gaussian_params_named"),
         ("DG", "dgauss_array", "dg_residual", "dg_chi2", "dg_params_named"),
+        ("EDG", "edg_array", "edg_residual", "edg_chi2", "edg_params_named"),
         ("GH", "gh_array", "gh_residual", "gh_chi2", "gh_params_named"),
         ("Moffat", "moffat_array", "moffat_residual", "moffat_chi2", "moffat_params_named"),
         ("Shapelet", "shapelet_array", "shapelet_residual", "shapelet_chi2", "shapelet_params_named"),
@@ -1005,29 +1234,31 @@ def plot_model_comparison_page(results, start, page_size, visit_id, detector_id,
             axes[row_idx, 2 * col_offset].set_title(f"{label} residual\nchi^2={chi2:.4e}", fontsize=8)
             fig.colorbar(im_res, ax=axes[row_idx, 2 * col_offset], shrink=0.75)
 
-        axes[row_idx, 11].plot(r["rp_radius"], r["rp_psf"], "o-", ms=2.5, lw=1.0, label="Observed star")
-        axes[row_idx, 11].plot(r["rp_radius"], r["rp_gaussian"], "o--", ms=2.5, lw=1.0, label="Gaussian")
-        axes[row_idx, 11].plot(r["rp_radius"], r["rp_dg"], "s--", ms=2.5, lw=1.0, label="Double Gaussian")
-        axes[row_idx, 11].plot(r["rp_radius"], r["rp_gh"], "^--", ms=2.5, lw=1.0, label="Gauss-Hermite")
-        axes[row_idx, 11].plot(r["rp_radius"], r["rp_moffat"], "v--", ms=2.5, lw=1.0, label="Moffat")
-        axes[row_idx, 11].plot(r["rp_radius"], r["rp_shapelet"], "d--", ms=2.5, lw=1.0, label="Shapelet")
-        axes[row_idx, 11].set_title("Radial profile", fontsize=9)
-        axes[row_idx, 11].set_xlabel("Radius [pixel]")
-        axes[row_idx, 11].set_ylabel("Mean intensity")
-        axes[row_idx, 11].grid(alpha=0.3)
-        axes[row_idx, 11].legend(fontsize=6)
+        axes[row_idx, 13].plot(r["rp_radius"], r["rp_psf"], "o-", ms=2.5, lw=1.0, label="Observed star")
+        axes[row_idx, 13].plot(r["rp_radius"], r["rp_gaussian"], "o--", ms=2.5, lw=1.0, label="Gaussian")
+        axes[row_idx, 13].plot(r["rp_radius"], r["rp_dg"], "s--", ms=2.5, lw=1.0, label="Double Gaussian")
+        axes[row_idx, 13].plot(r["rp_radius"], r["rp_edg"], "P--", ms=2.5, lw=1.0, label="Elliptical DG")
+        axes[row_idx, 13].plot(r["rp_radius"], r["rp_gh"], "^--", ms=2.5, lw=1.0, label="Gauss-Hermite")
+        axes[row_idx, 13].plot(r["rp_radius"], r["rp_moffat"], "v--", ms=2.5, lw=1.0, label="Moffat")
+        axes[row_idx, 13].plot(r["rp_radius"], r["rp_shapelet"], "d--", ms=2.5, lw=1.0, label="Shapelet")
+        axes[row_idx, 13].set_title("Radial profile", fontsize=9)
+        axes[row_idx, 13].set_xlabel("Radius [pixel]")
+        axes[row_idx, 13].set_ylabel("Mean intensity")
+        axes[row_idx, 13].grid(alpha=0.3)
+        axes[row_idx, 13].legend(fontsize=6)
 
-        axes[row_idx, 12].axhline(0.0, color="k", lw=1)
-        axes[row_idx, 12].plot(r["rp_radius"], r["rp_gaussian_residual"], "o-", ms=2.5, lw=1.0, label="Data - Gaussian")
-        axes[row_idx, 12].plot(r["rp_radius"], r["rp_dg_residual"], "s-", ms=2.5, lw=1.0, label="Data - DG")
-        axes[row_idx, 12].plot(r["rp_radius"], r["rp_gh_residual"], "^-", ms=2.5, lw=1.0, label="Data - GH")
-        axes[row_idx, 12].plot(r["rp_radius"], r["rp_moffat_residual"], "v-", ms=2.5, lw=1.0, label="Data - Moffat")
-        axes[row_idx, 12].plot(r["rp_radius"], r["rp_shapelet_residual"], "d-", ms=2.5, lw=1.0, label="Data - Shapelet")
-        axes[row_idx, 12].set_title("Profile residuals", fontsize=9)
-        axes[row_idx, 12].set_xlabel("Radius [pixel]")
-        axes[row_idx, 12].set_ylabel("Profile residual")
-        axes[row_idx, 12].grid(alpha=0.3)
-        axes[row_idx, 12].legend(fontsize=6)
+        axes[row_idx, 14].axhline(0.0, color="k", lw=1)
+        axes[row_idx, 14].plot(r["rp_radius"], r["rp_gaussian_residual"], "o-", ms=2.5, lw=1.0, label="Data - Gaussian")
+        axes[row_idx, 14].plot(r["rp_radius"], r["rp_dg_residual"], "s-", ms=2.5, lw=1.0, label="Data - DG")
+        axes[row_idx, 14].plot(r["rp_radius"], r["rp_edg_residual"], "P-", ms=2.5, lw=1.0, label="Data - EDG")
+        axes[row_idx, 14].plot(r["rp_radius"], r["rp_gh_residual"], "^-", ms=2.5, lw=1.0, label="Data - GH")
+        axes[row_idx, 14].plot(r["rp_radius"], r["rp_moffat_residual"], "v-", ms=2.5, lw=1.0, label="Data - Moffat")
+        axes[row_idx, 14].plot(r["rp_radius"], r["rp_shapelet_residual"], "d-", ms=2.5, lw=1.0, label="Data - Shapelet")
+        axes[row_idx, 14].set_title("Profile residuals", fontsize=9)
+        axes[row_idx, 14].set_xlabel("Radius [pixel]")
+        axes[row_idx, 14].set_ylabel("Profile residual")
+        axes[row_idx, 14].grid(alpha=0.3)
+        axes[row_idx, 14].legend(fontsize=6)
 
     plt.tight_layout()
     _render_and_display(fig)
@@ -1115,7 +1346,7 @@ def plot_bad_visit_gallery(results, visit_df, top_n_visits=3, n_examples=6):
             if not source_subset.empty:
                 source_subset["sourceId"] = source_subset["sourceId"].astype(str)
                 source_lookup = source_subset.drop_duplicates("sourceId").set_index("sourceId")[
-                    ["science_bad_star_flag", "high_ng_star_flag"]
+                    ["science_bad_star_flag", "high_ng_star_flag", "high_edg_deviation_star_flag"]
                 ].to_dict("index")
 
         for idx, result in enumerate(visit_results):
@@ -1128,11 +1359,15 @@ def plot_bad_visit_gallery(results, visit_df, top_n_visits=3, n_examples=6):
                     "ee80_radius": result.get("ee80_radius", np.nan),
                     "ellipticity": result.get("ellipticity", np.nan),
                     "ng_score": result.get("ng_score", np.nan),
+                    "edg_deviation_score": result.get("edg_deviation_score", np.nan),
                     "science_bad_star_flag": bool(
                         lookup.get("science_bad_star_flag", result.get("science_bad_star_flag", False))
                     ),
                     "high_ng_star_flag": bool(
                         lookup.get("high_ng_star_flag", result.get("high_ng_star_flag", False))
+                    ),
+                    "high_edg_deviation_star_flag": bool(
+                        lookup.get("high_edg_deviation_star_flag", result.get("high_edg_deviation_star_flag", False))
                     ),
                 }
             )
@@ -1141,7 +1376,7 @@ def plot_bad_visit_gallery(results, visit_df, top_n_visits=3, n_examples=6):
         if priority_df.empty:
             return priority_df
 
-        for metric in ["fwhm_proxy", "ee80_radius", "ellipticity", "ng_score"]:
+        for metric in ["fwhm_proxy", "ee80_radius", "ellipticity", "ng_score", "edg_deviation_score"]:
             priority_df[f"{metric}_display_z"] = _positive_robust_excursion(priority_df[metric]).fillna(0.0)
 
         priority_df["gallery_priority"] = (
@@ -1149,8 +1384,10 @@ def plot_bad_visit_gallery(results, visit_df, top_n_visits=3, n_examples=6):
             + 1.0 * priority_df["ee80_radius_display_z"]
             + 1.0 * priority_df["ellipticity_display_z"]
             + 1.25 * priority_df["ng_score_display_z"]
+            + 1.25 * priority_df["edg_deviation_score_display_z"]
             + 1.0 * priority_df["science_bad_star_flag"].astype(float)
             + 0.5 * priority_df["high_ng_star_flag"].astype(float)
+            + 0.5 * priority_df["high_edg_deviation_star_flag"].astype(float)
         )
         return priority_df
 
@@ -1161,7 +1398,7 @@ def plot_bad_visit_gallery(results, visit_df, top_n_visits=3, n_examples=6):
         if not priority_df.empty:
             chosen_indices = (
                 priority_df.sort_values(
-                    ["gallery_priority", "ng_score", "ellipticity", "fwhm_proxy"],
+                    ["gallery_priority", "edg_deviation_score", "ng_score", "ellipticity", "fwhm_proxy"],
                     ascending=False,
                     na_position="last",
                 )["result_index"]
@@ -1195,21 +1432,24 @@ def plot_bad_visit_gallery(results, visit_df, top_n_visits=3, n_examples=6):
             title_prefix = ""
             if col_idx == 0:
                 title_prefix = (
-                    "VB={:.2f} S={:.2f} Sh={:.2f}\nNG={:.2f} Sp={:.2f}\n".format(
+                    "VB={:.2f} S={:.2f} Sh={:.2f}\nNG={:.2f} EDG={:.2f} Sp={:.2f}\n".format(
                         visit_meta.get("visit_badness", np.nan),
                         visit_meta.get("size_excursion", np.nan),
                         visit_meta.get("shape_excursion", np.nan),
                         visit_meta.get("non_gaussian_excursion", np.nan),
+                        visit_meta.get("edg_deviation_excursion", np.nan),
                         visit_meta.get("spatial_nonuniformity", np.nan),
                     )
                 )
             ax.set_title(
-                title_prefix + "visit=%s\n(x=%.0f, y=%.0f)\nng=%.2f  e=%.2f"
+                title_prefix + "visit=%s  best=%s\n(x=%.0f, y=%.0f)\nng=%.2f  edg=%.2f  e=%.2f"
                 % (
                     result.get("visit"),
+                    result.get("best_model", "none"),
                     result.get("x", np.nan),
                     result.get("y", np.nan),
                     result.get("ng_score", np.nan),
+                    result.get("edg_deviation_score", np.nan),
                     result.get("ellipticity", np.nan),
                 ),
                 fontsize=8,
