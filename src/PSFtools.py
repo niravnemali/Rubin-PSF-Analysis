@@ -101,4 +101,157 @@ def plotPanels(visit_id, position_star, star_image_array, psf_array):
     return
 
 
+############################################
+# Butler-based star extraction and analysis
+############################################
+
+
+def extract_star_data(butler, visit_ref, stars_per_detector=5):
+    """
+    For one preliminary_visit_image ref, query the single_visit_star catalog
+    for calib_psf_used star positions, extract normalized flux cutouts from
+    the visit image, and compute the PSF FWHM at each star's position.
+
+    Parameters
+    ----------
+    butler             : lsst.daf.butler.Butler
+    visit_ref          : DatasetRef for a preliminary_visit_image
+    stars_per_detector : maximum number of stars to extract
+
+    Returns
+    -------
+    star_data : list of (star_array, x, y, psf_fwhm, rubin_psf_norm)
+    n_skipped : int
+    """
+    import time
+    import fittingTools
+
+    visit_id    = visit_ref.dataId['visit']
+    detector_id = visit_ref.dataId['detector']
+
+    visit_image = butler.get(visit_ref)
+    psf = visit_image.getPsf()
+
+    reference_position = lsst.geom.Point2D(300, 300)
+    reference_stamp_dims = psf.computeImage(reference_position).getDimensions()
+    print(f"  PSF stamp size: {reference_stamp_dims} pix")
+
+    selected_columns = ['x', 'y', 'detector', 'calib_psf_used']
+    tableAll = butler.get(
+        "single_visit_star",
+        instrument="LSSTCam",
+        visit=visit_id,
+        detector=detector_id,
+        parameters={"columns": selected_columns},
+    )
+    table = tableAll[tableAll['calib_psf_used'] == True]
+
+    if len(table) == 0:
+        print("  No calib_psf_used stars found")
+        return [], 0
+
+    n_stars = min(stars_per_detector, len(table))
+    print(f"  {len(table)} calib_psf_used stars available, using {n_stars}")
+    print('  Route B: Butler -> visit_image -> getCutout(position, stamp size) -> observed star array')
+    t0 = time.time()
+
+    star_data = []
+    n_skipped = 0
+    for i in range(n_stars):
+        try:
+            x_star = table['x'][i]
+            y_star = table['y'][i]
+            position_star = lsst.geom.Point2D(x_star, y_star)
+
+            rubin_psf_model = psf.computeImage(position_star)
+            stamp_dims = rubin_psf_model.getDimensions()
+            xlen = stamp_dims.getX()
+            ylen = stamp_dims.getY()
+
+            star_cutout = visit_image.getCutout(position_star, lsst.geom.Extent2I(xlen, ylen))
+            star_image_array = star_cutout.getMaskedImage().image.array.astype(float)
+
+            star_flux = np.sum(star_image_array)
+            if not np.isfinite(star_flux) or star_flux <= 0:
+                raise ValueError('non-positive observed cutout flux')
+            star_image_array /= star_flux
+
+            psf_shape = psf.computeShape(position_star)
+            psf_fwhm = psf_shape.getDeterminantRadius() * fittingTools.SIGMA_TO_FWHM
+            rubin_psf_norm = rubin_psf_model.array / np.sum(rubin_psf_model.array)
+
+            star_data.append((star_image_array, x_star, y_star, psf_fwhm, rubin_psf_norm))
+        except Exception as e:
+            n_skipped += 1
+            print('  Star %d skipped in extraction: %s' % (i, e))
+
+    t_extract = time.time() - t0
+    print(f'  Extraction done: {len(star_data)}/{n_stars} stars in {t_extract:.2f}s')
+    return star_data, n_skipped
+
+
+def run_detector_analysis(butler, visitimage_refs, detNAMEarr, stars_per_detector=5):
+    """
+    Run the full PSF model-comparison analysis loop over all detectors in
+    visitimage_refs (one visit, 21 central CCDs).
+
+    Parameters
+    ----------
+    butler             : lsst.daf.butler.Butler
+    visitimage_refs    : query result from butler.query_datasets('preliminary_visit_image', ...)
+    detNAMEarr         : list of detector name strings (same order as visitimage_refs)
+    stars_per_detector : maximum number of calib_psf_used stars to use per detector
+
+    Returns
+    -------
+    all_star_records : list of record dicts, ready for fittingTools.build_master_table()
+    all_visit_results: dict keyed by detector_id, ready for fittingTools.plot_model_comparison_pages()
+    """
+    import time
+    import fittingTools
+
+    all_star_records = []
+    all_visit_results = {}
+
+    for iID in range(len(visitimage_refs)):
+        visit_ref   = visitimage_refs[iID]
+        visit_id    = visit_ref.dataId['visit']
+        detector_id = visit_ref.dataId['detector']
+        band        = visit_ref.dataId['band']
+        day_obs_det = visit_ref.dataId['day_obs']
+
+        print(f"\n--- Detector {detector_id} ({detNAMEarr[iID]}), Visit {visit_id}, Band {band} ---")
+
+        try:
+            star_data, n_skipped_extract = extract_star_data(
+                butler, visit_ref, stars_per_detector=stars_per_detector)
+        except Exception as e:
+            print(f"  Skipping detector (catalog error): {e}")
+            continue
+
+        if not star_data:
+            continue
+
+        t0 = time.time()
+        results, n_skipped_fit = fittingTools.fit_stars_parallel(star_data)
+        t_compute = time.time() - t0
+        print('  Fitting done: %d/%d stars in %.2fs (%d skipped)' % (
+            len(results), len(star_data), t_compute, n_skipped_fit))
+
+        for r in results:
+            record = fittingTools.build_star_record(
+                r, visit_id=visit_id, detector_id=detector_id,
+                band=band, day_obs=day_obs_det)
+            all_star_records.append(record)
+
+        all_visit_results[detector_id] = {
+            'results':     results,
+            'detector_id': detector_id,
+            'band':        band,
+        }
+
+    print(f"\nDone: {len(all_star_records)} stars accumulated across {len(all_visit_results)} detectors")
+    return all_star_records, all_visit_results
+
+
 

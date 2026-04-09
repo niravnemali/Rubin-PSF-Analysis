@@ -791,6 +791,157 @@ def plot_best_model_counts(results):
     return counts
 
 
+############################################
+# 8. Record building
+############################################
+
+
+def build_star_record(r, visit_id=None, detector_id=None, band=None, day_obs=None):
+    """
+    Build a flat record dict from one analyze_psf_models result.
+
+    All metadata arguments are optional so this can be called for a single
+    star array without any butler context, e.g.:
+        result = fittingTools.analyze_psf_models(star2D)
+        record = fittingTools.build_star_record(result)
+    """
+    record = {
+        'visit_id':    visit_id,
+        'detector_id': detector_id,
+        'band':        band,
+        'day_obs':     day_obs,
+        'x':           round(r['x'],    3) if r['x']    is not None else None,
+        'y':           round(r['y'],    3) if r['y']    is not None else None,
+        'fwhm':        round(r['fwhm'], 4) if r['fwhm'] is not None else None,
+        # Chi2
+        'dg_chi2':       round(r['dg_chi2'],       8),
+        'gh_chi2':       round(r['gh_chi2'],       8),
+        'moffat_chi2':   round(r['moffat_chi2'],   8),
+        'shapelet_chi2': round(r['shapelet_chi2'], 8),
+        # Double Gaussian: [a1, sigma1, a2, sigma2]
+        'dg_a1':     round(float(r['dg_params'][0]), 6),
+        'dg_sigma1': round(float(r['dg_params'][1]), 4),
+        'dg_a2':     round(float(r['dg_params'][2]), 6),
+        'dg_sigma2': round(float(r['dg_params'][3]), 4),
+        # Gauss-Hermite: [A, x0, y0, sigma_x, sigma_y, h3x, h4x, h3y, h4y, B]
+        'gh_A':       round(float(r['gh_params'][0]), 6),
+        'gh_x0':      round(float(r['gh_params'][1]), 3),
+        'gh_y0':      round(float(r['gh_params'][2]), 3),
+        'gh_sigma_x': round(float(r['gh_params'][3]), 4),
+        'gh_sigma_y': round(float(r['gh_params'][4]), 4),
+        'gh_h3x':     round(float(r['gh_params'][5]), 6),
+        'gh_h4x':     round(float(r['gh_params'][6]), 6),
+        'gh_h3y':     round(float(r['gh_params'][7]), 6),
+        'gh_h4y':     round(float(r['gh_params'][8]), 6),
+        'gh_B':       round(float(r['gh_params'][9]), 8),
+        # Moffat: [A, x0, y0, alpha, beta, B]
+        'moffat_A':     round(float(r['moffat_params'][0]), 6),
+        'moffat_x0':    round(float(r['moffat_params'][1]), 3),
+        'moffat_y0':    round(float(r['moffat_params'][2]), 3),
+        'moffat_alpha': round(float(r['moffat_params'][3]), 4),
+        'moffat_beta':  round(float(r['moffat_params'][4]), 4),
+        'moffat_B':     round(float(r['moffat_params'][5]), 8),
+    }
+    # Shapelet coefficients: sh_c{n1}_{n2}  (28 columns for nmax=6)
+    for (n1, n2), coeff in zip(r['shapelet_result']['modes'], r['shapelet_result']['coeffs']):
+        record[f'sh_c{n1}_{n2}'] = round(float(coeff), 6)
+    return record
+
+
+############################################
+# 9. Parallel fitting
+############################################
+
+
+def fit_stars_parallel(star_data, n_workers=None):
+    """
+    Fit a list of (star_array, x, y, fwhm, rubin_psf) tuples in parallel.
+
+    Parameters
+    ----------
+    star_data : list of (ndarray, float, float, float, ndarray)
+    n_workers : int, optional  Number of threads (default: min(len, cpu_count))
+
+    Returns
+    -------
+    results  : list of analyze_psf_models dicts (input order, failures omitted)
+    n_skipped: int
+    """
+    import os
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    if not star_data:
+        return [], 0
+
+    def _fit_one(args):
+        star_array, x, y, fwhm, rubin_psf = args
+        result = analyze_psf_models(star_array, x=x, y=y, fwhm=fwhm)
+        result['rubin_psf_array'] = rubin_psf
+        return result
+
+    n = n_workers if n_workers is not None else min(len(star_data), os.cpu_count() or 4)
+    results_ordered = [None] * len(star_data)
+    n_skipped = 0
+
+    with ThreadPoolExecutor(max_workers=n) as executor:
+        future_to_idx = {executor.submit(_fit_one, args): i
+                         for i, args in enumerate(star_data)}
+        for future in as_completed(future_to_idx):
+            i = future_to_idx[future]
+            try:
+                results_ordered[i] = future.result()
+            except Exception as e:
+                n_skipped += 1
+                print('Star %d skipped in fitting: %s' % (i, e))
+
+    return [r for r in results_ordered if r is not None], n_skipped
+
+
+############################################
+# 10. Master table helpers
+############################################
+
+
+def build_master_table(all_star_records):
+    """
+    Build a pandas DataFrame from accumulated star records and print a
+    sectioned summary (same layout as the data loading notebook).
+    """
+    import pandas as pd
+
+    master_table = pd.DataFrame(all_star_records)
+
+    meta_cols   = ['visit_id', 'detector_id', 'band', 'day_obs', 'x', 'y', 'fwhm']
+    chi2_cols   = ['dg_chi2', 'gh_chi2', 'moffat_chi2', 'shapelet_chi2']
+    dg_cols     = ['dg_a1', 'dg_sigma1', 'dg_a2', 'dg_sigma2']
+    gh_cols     = ['gh_A', 'gh_x0', 'gh_y0', 'gh_sigma_x', 'gh_sigma_y',
+                   'gh_h3x', 'gh_h4x', 'gh_h3y', 'gh_h4y', 'gh_B']
+    moffat_cols = ['moffat_A', 'moffat_x0', 'moffat_y0', 'moffat_alpha', 'moffat_beta', 'moffat_B']
+    sh_cols     = [c for c in master_table.columns if c.startswith('sh_c')]
+
+    print(f"Master table: {len(master_table)} stars across {master_table['detector_id'].nunique()} detectors\n")
+    print("=== Metadata & Star Info ===")
+    print(master_table[meta_cols].to_string(index=True))
+    print("\n=== Chi\u00b2 (all models) ===")
+    print(master_table[['detector_id'] + chi2_cols].to_string(index=True))
+    print("\n=== Double Gaussian Coefficients ===")
+    print(master_table[['detector_id'] + dg_cols].to_string(index=True))
+    print("\n=== Gauss-Hermite Coefficients ===")
+    print(master_table[['detector_id'] + gh_cols].to_string(index=True))
+    print("\n=== Moffat Coefficients ===")
+    print(master_table[['detector_id'] + moffat_cols].to_string(index=True))
+    print("\n=== Shapelet Coefficients ===")
+    print(master_table[['detector_id'] + sh_cols].to_string(index=True))
+
+    return master_table
+
+
+def save_master_table(master_table, path='psf_table.csv'):
+    """Save a master table DataFrame to CSV."""
+    master_table.to_csv(path, index=True)
+    print(f"Saved {len(master_table)} rows to '{path}'")
+
+
 if __name__ == "__main__":
     print("fittingTools.py is intended to be imported from a notebook or script.")
     print("Example:")
