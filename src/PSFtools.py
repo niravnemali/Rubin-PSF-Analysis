@@ -144,7 +144,7 @@ def extract_star_data(butler, visit_ref, stars_per_detector=5):
         detector=detector_id,
         parameters={"columns": selected_columns},
     )
-    table = tableAll[tableAll['calib_psf_used'] == True]
+    table = tableAll[(tableAll['detector'] == detector_id) & (tableAll['calib_psf_used'] == True)]
 
     if len(table) == 0:
         print("  No calib_psf_used stars found")
